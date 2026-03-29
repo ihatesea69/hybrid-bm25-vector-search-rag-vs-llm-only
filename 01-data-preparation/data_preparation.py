@@ -113,6 +113,9 @@ VENV_PYTHON = (
     if sys.platform.startswith("win")
     else VENV / "bin" / "python"
 )
+ENV = dict(os.environ)
+ENV["UV_CACHE_DIR"] = str(UV_CACHE_DIR)
+RUNTIME_ENV_VAR = "NUTRITION_PHASE1_IN_VENV"
 
 NFCORPUS_JSONL = ROOT / "nfcorpus_nutrition.jsonl"
 NUTRITION_WEB_JSONL = ROOT / "nutrition_crawl.jsonl"
@@ -131,6 +134,52 @@ PACKAGE_TO_MODULE = {
     "datasets": "datasets",
     "pypdf": "pypdf",
 }
+
+
+def module_available(module_name: str) -> bool:
+    try:
+        return importlib.util.find_spec(module_name) is not None
+    except ModuleNotFoundError:
+        return False
+
+
+def running_in_local_venv() -> bool:
+    return Path(sys.executable).resolve() == VENV_PYTHON.resolve()
+
+
+def venv_has_runtime_modules() -> bool:
+    if not VENV_PYTHON.exists():
+        return False
+    probe = "import datasets, bs4, pypdf"
+    result = subprocess.run(
+        [str(VENV_PYTHON), "-c", probe],
+        env=ENV,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def ensure_running_in_local_venv() -> None:
+    if running_in_local_venv() or os.environ.get(RUNTIME_ENV_VAR) == "1":
+        return
+    activate_local_site_packages(install_missing=True)
+    if not venv_has_runtime_modules():
+        subprocess.run(
+            ["uv", "pip", "install", "--python", str(VENV_PYTHON), "-r", str(REQUIREMENTS)],
+            check=True,
+            env=ENV,
+        )
+    child_env = dict(ENV)
+    child_env.update(os.environ)
+    child_env[RUNTIME_ENV_VAR] = "1"
+    result = subprocess.run(
+        [str(VENV_PYTHON), str(Path(__file__)), *sys.argv[1:]],
+        env=child_env,
+        check=False,
+    )
+    raise SystemExit(result.returncode)
 
 
 def normalize_text(text: str) -> str:
@@ -369,38 +418,38 @@ def utc_now_iso() -> str:
 
 
 def activate_local_site_packages(install_missing: bool) -> Path:
-    env = dict(os.environ)
-    env["UV_CACHE_DIR"] = str(UV_CACHE_DIR)
-
     if not VENV.exists():
         subprocess.run(
             ["uv", "venv", str(VENV), "--python", sys.executable],
             check=True,
-            env=env,
+            env=ENV,
         )
 
-    site_packages = Path(
+    site_paths = json.loads(
         subprocess.check_output(
-            [str(VENV_PYTHON), "-c", "import site; print(site.getsitepackages()[0])"],
+            [str(VENV_PYTHON), "-c", "import site, json; print(json.dumps(site.getsitepackages()))"],
             text=True,
+            env=ENV,
         ).strip()
     )
-    site.addsitedir(str(site_packages))
+    for site_path in site_paths:
+        site.addsitedir(site_path)
 
     missing = [
         package
         for package, module_name in PACKAGE_TO_MODULE.items()
-        if importlib.util.find_spec(module_name) is None
+        if not module_available(module_name)
     ]
     if missing and install_missing:
         subprocess.run(
             ["uv", "pip", "install", "--python", str(VENV_PYTHON), "-r", str(REQUIREMENTS)],
             check=True,
-            env=env,
+            env=ENV,
         )
-        site.addsitedir(str(site_packages))
+        for site_path in site_paths:
+            site.addsitedir(site_path)
 
-    return site_packages
+    return Path(site_paths[-1])
 
 
 def bootstrap() -> None:
@@ -775,7 +824,11 @@ def main() -> int:
 
     if args.command == "bootstrap":
         bootstrap()
-    elif args.command == "build-nfcorpus":
+        return 0
+    else:
+        ensure_running_in_local_venv()
+
+    if args.command == "build-nfcorpus":
         build_nfcorpus_nutrition(force=args.force)
     elif args.command == "crawl-nutrition":
         crawl_nutrition_sources(force=args.force)
