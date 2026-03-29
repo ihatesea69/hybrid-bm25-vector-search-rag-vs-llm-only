@@ -41,6 +41,7 @@ output/
 !01-data-preparation/data/node_record.schema.json
 !01-data-preparation/data/annotation_record.schema.json
 01-data-preparation/*.jsonl
+!01-data-preparation/pubmed_kb.jsonl
 
 # Phase 2: keep only lightweight contract/config/query files in data
 02-indexing/data/*
