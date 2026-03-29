@@ -1,0 +1,61 @@
+# Workspace / agent state
+.omx/
+.omix/
+
+# Python env / caches
+**/.venv/
+**/.uv-cache/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.tsbuildinfo
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+node_modules/
+**/node_modules/
+**/.next/
+coverage/
+tmp/
+
+# Root-only submission / reference files
+/*.pdf
+/*.doc
+/*.docx
+/*.ppt
+/*.pptx
+sample_report_from_user.md
+.env
+
+# Generated deliverables
+output/
+
+# Phase 1: keep only lightweight contract/config files in data
+01-data-preparation/data/*
+!01-data-preparation/data/source_registry.csv
+!01-data-preparation/data/source.schema.json
+!01-data-preparation/data/document_record.schema.json
+!01-data-preparation/data/node_record.schema.json
+!01-data-preparation/data/annotation_record.schema.json
+01-data-preparation/*.jsonl
+
+# Phase 2: keep only lightweight contract/config/query files in data
+02-indexing/data/*
+!02-indexing/data/source_registry.csv
+!02-indexing/data/source.schema.json
+!02-indexing/data/node_record.schema.json
+!02-indexing/data/benchmark_queries.jsonl
+!02-indexing/data/benchmark_qrels_test.tsv
+
+# Future local artifacts for remaining phases
+03-retrieval/data/
+03-retrieval/logs/
+03-retrieval/artifacts/
+03-retrieval/results/
+04-evaluation/data/
+04-evaluation/logs/
+04-evaluation/reports/
+04-evaluation/results/

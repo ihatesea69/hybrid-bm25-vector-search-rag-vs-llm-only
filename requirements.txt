@@ -1,0 +1,24 @@
+llama-index
+llama-index-readers-file
+llama-index-embeddings-openai
+llama-index-llms-openai
+ipykernel
+beautifulsoup4
+datasets
+networkx
+numpy
+openai
+pypdf
+psycopg[binary]
+python-dotenv
+python-docx
+scikit-learn
+sentence-transformers
+fastapi
+uvicorn
+httpx
+pytest
+
+# Optional OCR fallback
+pdf2image
+pytesseract
