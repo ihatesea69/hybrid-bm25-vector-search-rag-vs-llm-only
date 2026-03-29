@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useDeferredValue, useState, useTransition } from "react";
+import { useDeferredValue, useEffect, useEffectEvent, useRef, useState, useTransition } from "react";
 import { useSearchParams } from "next/navigation";
 
 import { StatusPill } from "@/components/status-pill";
@@ -74,6 +74,7 @@ function AnswerPanel({
 export function DemoClient({ initialKbSummary, sampleQueries }: DemoClientProps) {
   const searchParams = useSearchParams();
   const seededQuery = searchParams.get("q") ?? sampleQueries[0] ?? "";
+  const autorun = searchParams.get("autorun") === "1";
   const [queryText, setQueryText] = useState(seededQuery);
   const [topK, setTopK] = useState(5);
   const [result, setResult] = useState<DemoQueryPayload | null>(null);
@@ -81,6 +82,7 @@ export function DemoClient({ initialKbSummary, sampleQueries }: DemoClientProps)
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isPending, startTransition] = useTransition();
   const deferredQuery = useDeferredValue(queryText);
+  const hasAutoRun = useRef(false);
 
   async function submitQuery(nextQuery?: string) {
     const query = (nextQuery ?? queryText).trim();
@@ -114,6 +116,18 @@ export function DemoClient({ initialKbSummary, sampleQueries }: DemoClientProps)
       setIsSubmitting(false);
     }
   }
+
+  const runSeededQuery = useEffectEvent(() => {
+    void submitQuery(seededQuery);
+  });
+
+  useEffect(() => {
+    if (!autorun || hasAutoRun.current) {
+      return;
+    }
+    hasAutoRun.current = true;
+    runSeededQuery();
+  }, [autorun]);
 
   return (
     <div className="mx-auto flex w-full max-w-7xl flex-col gap-8 px-6 py-12 md:px-10">

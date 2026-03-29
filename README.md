@@ -88,6 +88,28 @@ This produces:
 
 The demo app is local-only. It reads the indexed data and the latest evaluation artifacts already produced by the pipeline.
 
+### What you can do in the demo
+
+- inspect the latest evaluation snapshot from the benchmark run
+- compare `hybrid_rag` and `llm_only` answers for the same question
+- inspect the top retrieved passages used by the grounded answer
+- check inline citations and timing breakdowns for a live query
+- use preset prompts for a quick walkthrough during a demo session
+
+### Screenshots
+
+Dashboard:
+
+![Dashboard](docs/screenshots/dashboard.png)
+
+Workbench before running a query:
+
+![Demo workbench](docs/screenshots/demo-workbench.png)
+
+Workbench after a live query:
+
+![Demo results](docs/screenshots/demo-results.png)
+
 Start it with two terminals.
 
 Terminal 1:
