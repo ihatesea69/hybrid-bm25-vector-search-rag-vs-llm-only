@@ -33,21 +33,18 @@ sample_report_from_user.md
 # Generated deliverables
 output/
 
-# Phase 1: keep only lightweight contract/config files in data
+# Phase 1: keep current data files
 01-data-preparation/data/*
 !01-data-preparation/data/source_registry.csv
 !01-data-preparation/data/source.schema.json
 !01-data-preparation/data/document_record.schema.json
 !01-data-preparation/data/node_record.schema.json
 !01-data-preparation/data/annotation_record.schema.json
-01-data-preparation/*.jsonl
-!01-data-preparation/pubmed_kb.jsonl
 
-# Phase 2: keep only lightweight contract/config/query files in data
+# Phase 2: keep current data files
 02-indexing/data/*
-!02-indexing/data/source_registry.csv
-!02-indexing/data/source.schema.json
-!02-indexing/data/node_record.schema.json
+!02-indexing/data/index_documents.jsonl
+!02-indexing/data/index_nodes.jsonl
 !02-indexing/data/benchmark_queries.jsonl
 !02-indexing/data/benchmark_qrels_test.tsv
 
