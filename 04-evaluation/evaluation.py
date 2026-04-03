@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import csv
 import importlib.util
 import json
@@ -35,9 +34,27 @@ ENV_FILE = PROJECT_ROOT / ".env"
 PACKAGE_TO_MODULE = {
     "psycopg[binary]": "psycopg",
     "python-dotenv": "dotenv",
-    "llama-index": "llama_index",
-    "llama-index-llms-openai": "llama_index.llms.openai",
+    "deepeval": "deepeval",
 }
+
+ANSWER_RELEVANCY_THRESHOLD = 0.5
+FAITHFULNESS_THRESHOLD = 0.5
+CORRECTNESS_THRESHOLD = 0.6
+PAIRWISE_THRESHOLD = 0.6
+
+CORRECTNESS_EVALUATION_STEPS = [
+    "Read the input question, the actual output, and the expected output derived from retrieved evidence.",
+    "Check whether the actual output answers the question directly and stays within the scope of the evidence-backed expected output.",
+    "Penalize unsupported claims, contradictions, overconfident medical assertions, and omission of uncertainty when the expected output is inconclusive.",
+    "Reward answers that are accurate, cautious, and aligned with the evidence-grounded expected output.",
+]
+
+PAIRWISE_EVALUATION_STEPS = [
+    "Compare the actual output against the expected output as two competing answers to the same question.",
+    "Use the retrieval context as the grounding source whenever it is available.",
+    "Prefer the answer that is more evidence-grounded, more medically cautious, more directly responsive, and less speculative.",
+    "Give a high score only when the actual output is clearly better than the expected output; give a low score when the expected output is stronger or the actual output is unsupported.",
+]
 
 
 def parse_env_file(path: Path) -> dict[str, str]:
@@ -77,10 +94,7 @@ def running_in_local_venv() -> bool:
 def venv_has_runtime_modules() -> bool:
     if not VENV_PYTHON.exists():
         return False
-    probe = (
-        "import dotenv, psycopg, llama_index; "
-        "import llama_index.llms.openai, llama_index.core.evaluation"
-    )
+    probe = "import dotenv, psycopg, deepeval"
     result = subprocess.run(
         [str(VENV_PYTHON), "-c", probe],
         env=ENV,
@@ -135,24 +149,23 @@ def bootstrap() -> None:
 def ensure_runtime():
     provision_local_venv(install_missing=True)
     from dotenv import load_dotenv
-    from llama_index.core.evaluation import (
-        CorrectnessEvaluator,
-        FaithfulnessEvaluator,
-        PairwiseComparisonEvaluator,
-        RelevancyEvaluator,
-    )
-    from llama_index.llms.openai import OpenAI
+    load_dotenv(ENV_FILE, override=False)
+    from deepeval.metrics import AnswerRelevancyMetric, FaithfulnessMetric, GEval
+    from deepeval.metrics.g_eval.utils import Rubric
+    from deepeval.models import GPTModel
+    from deepeval.test_case import LLMTestCase, LLMTestCaseParams
     import psycopg
     from psycopg.rows import dict_row
     from psycopg.types.json import Jsonb
 
-    load_dotenv(ENV_FILE, override=False)
     return {
-        "CorrectnessEvaluator": CorrectnessEvaluator,
-        "FaithfulnessEvaluator": FaithfulnessEvaluator,
-        "PairwiseComparisonEvaluator": PairwiseComparisonEvaluator,
-        "RelevancyEvaluator": RelevancyEvaluator,
-        "OpenAI": OpenAI,
+        "AnswerRelevancyMetric": AnswerRelevancyMetric,
+        "FaithfulnessMetric": FaithfulnessMetric,
+        "GEval": GEval,
+        "GPTModel": GPTModel,
+        "LLMTestCase": LLMTestCase,
+        "LLMTestCaseParams": LLMTestCaseParams,
+        "Rubric": Rubric,
         "psycopg": psycopg,
         "dict_row": dict_row,
         "Jsonb": Jsonb,
@@ -191,6 +204,107 @@ def normalize_answer_mode(mode: str) -> str:
         "llm_only": "llm_only",
     }
     return aliases.get(mode, mode)
+
+
+def evaluation_model_name() -> str:
+    return env_str("OPENAI_LLM_MODEL", "gpt-4.1-mini") or "gpt-4.1-mini"
+
+
+def evaluation_base_url() -> str:
+    return env_str("OPENAI_BASE_URL", "https://api.openai.com/v1") or "https://api.openai.com/v1"
+
+
+def build_deepeval_model():
+    api_key = env_str("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is required for DeepEval-based evaluation.")
+    rt = ensure_runtime()
+    GPTModel = rt["GPTModel"]
+    return GPTModel(
+        model=evaluation_model_name(),
+        api_key=api_key,
+        base_url=evaluation_base_url(),
+    )
+
+
+def extract_contexts(bundle: list[dict[str, Any]] | None) -> list[str]:
+    contexts: list[str] = []
+    for item in bundle or []:
+        text = item.get("text") or item.get("body") or ""
+        cleaned = str(text).strip()
+        if cleaned:
+            contexts.append(cleaned)
+    return contexts
+
+
+def reference_answer_from_contexts(contexts: list[str]) -> str | None:
+    selected = [context for context in contexts[:3] if context]
+    return "\n\n".join(selected) if selected else None
+
+
+def normalize_metric_payload(
+    *,
+    score: float | None,
+    passing: bool,
+    feedback: str,
+    threshold: float,
+    model_name: str,
+    raw: dict[str, Any],
+) -> dict[str, Any]:
+    normalized_score = round(float(score), 4) if score is not None else None
+    return {
+        "score": normalized_score,
+        "passing": passing,
+        "feedback": feedback,
+        "threshold": threshold,
+        "model": model_name,
+        "raw": raw,
+    }
+
+
+def metric_error_payload(
+    *,
+    threshold: float,
+    model_name: str,
+    error: Exception | str,
+    score: float | None = None,
+    short_circuit: bool = False,
+) -> dict[str, Any]:
+    message = str(error)
+    return normalize_metric_payload(
+        score=score,
+        passing=False,
+        feedback=message,
+        threshold=threshold,
+        model_name=model_name,
+        raw={
+            "error": message,
+            "error_type": type(error).__name__ if isinstance(error, Exception) else "RuntimeError",
+            "short_circuit": short_circuit,
+        },
+    )
+
+
+def metric_payload_from_instance(metric, model_name: str) -> dict[str, Any]:
+    score = getattr(metric, "score", None)
+    passing = bool(getattr(metric, "success", False))
+    feedback = str(getattr(metric, "reason", "") or "")
+    threshold = float(getattr(metric, "threshold", 0.0) or 0.0)
+    evaluation_model = getattr(metric, "evaluation_model", None)
+    return normalize_metric_payload(
+        score=score,
+        passing=passing,
+        feedback=feedback,
+        threshold=threshold,
+        model_name=str(evaluation_model or model_name),
+        raw={
+            "score": score,
+            "success": getattr(metric, "success", None),
+            "reason": getattr(metric, "reason", None),
+            "threshold": threshold,
+            "evaluation_model": str(evaluation_model or model_name),
+        },
+    )
 
 
 def load_qrels(path: Path) -> dict[str, dict[str, int]]:
@@ -285,12 +399,98 @@ def load_pairwise_summary() -> dict[str, Any]:
     rows = load_json_artifact(RESULTS_DIR / "pairwise_hybrid_rag_vs_llm_only.json", [])
     if not rows:
         return {"rows": 0, "hybrid_rag_wins": 0, "hybrid_rag_win_rate": 0.0}
-    left_wins = sum(1 for row in rows if row.get("payload", {}).get("score") == 1.0)
+    left_wins = sum(
+        1
+        for row in rows
+        if row.get("preferred_left") is True or row.get("payload", {}).get("preferred_left") is True
+    )
     return {
         "rows": len(rows),
         "hybrid_rag_wins": left_wins,
         "hybrid_rag_win_rate": round(left_wins / len(rows), 4),
     }
+
+
+def build_correctness_metric(model):
+    rt = ensure_runtime()
+    GEval = rt["GEval"]
+    LLMTestCaseParams = rt["LLMTestCaseParams"]
+    Rubric = rt["Rubric"]
+    return GEval(
+        name="Correctness",
+        evaluation_params=[
+            LLMTestCaseParams.INPUT,
+            LLMTestCaseParams.ACTUAL_OUTPUT,
+            LLMTestCaseParams.EXPECTED_OUTPUT,
+        ],
+        evaluation_steps=CORRECTNESS_EVALUATION_STEPS,
+        rubric=[
+            Rubric(score_range=(0, 2), expected_outcome="The answer is unsupported, contradictory, or medically unsafe."),
+            Rubric(score_range=(3, 5), expected_outcome="The answer is partially correct but misses key evidence or is too assertive."),
+            Rubric(score_range=(6, 8), expected_outcome="The answer is mostly correct, grounded, and appropriately cautious."),
+            Rubric(score_range=(9, 10), expected_outcome="The answer is directly correct, evidence-aligned, and clearly calibrated about uncertainty."),
+        ],
+        model=model,
+        threshold=CORRECTNESS_THRESHOLD,
+        async_mode=False,
+    )
+
+
+def build_pairwise_metric(model):
+    rt = ensure_runtime()
+    GEval = rt["GEval"]
+    LLMTestCaseParams = rt["LLMTestCaseParams"]
+    Rubric = rt["Rubric"]
+    return GEval(
+        name="PairwisePreference",
+        evaluation_params=[
+            LLMTestCaseParams.INPUT,
+            LLMTestCaseParams.ACTUAL_OUTPUT,
+            LLMTestCaseParams.EXPECTED_OUTPUT,
+            LLMTestCaseParams.RETRIEVAL_CONTEXT,
+        ],
+        evaluation_steps=PAIRWISE_EVALUATION_STEPS,
+        rubric=[
+            Rubric(score_range=(0, 2), expected_outcome="The expected output is clearly stronger or the actual output is unsupported."),
+            Rubric(score_range=(3, 5), expected_outcome="The two answers are close, mixed, or the actual output is only weakly preferable."),
+            Rubric(score_range=(6, 8), expected_outcome="The actual output is meaningfully better grounded, safer, and more directly responsive."),
+            Rubric(score_range=(9, 10), expected_outcome="The actual output is clearly superior with strong grounding and careful medical phrasing."),
+        ],
+        model=model,
+        threshold=PAIRWISE_THRESHOLD,
+        async_mode=False,
+    )
+
+
+def load_retrieval_contexts(batch_id: str, query_ids: list[str]) -> dict[str, list[str]]:
+    filtered_ids = [query_id for query_id in query_ids if query_id]
+    if not filtered_ids:
+        return {}
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT query_id, results
+            FROM retrieval_runs
+            WHERE batch_id = %(batch_id)s::uuid
+              AND mode = 'hybrid'
+              AND query_id = ANY(%(query_ids)s)
+            """,
+            {"batch_id": batch_id, "query_ids": filtered_ids},
+        )
+        rows = list(cur.fetchall())
+    return {
+        row["query_id"]: extract_contexts(row["results"])
+        for row in rows
+    }
+
+
+def measure_metric(metric, test_case, model_name: str) -> dict[str, Any]:
+    try:
+        metric.measure(test_case, _show_indicator=False, _log_metric_to_confident=False)
+        return metric_payload_from_instance(metric, model_name)
+    except Exception as exc:
+        threshold = float(getattr(metric, "threshold", 0.0) or 0.0)
+        return metric_error_payload(threshold=threshold, model_name=model_name, error=exc)
 
 
 def latest_batch_id(table: str, mode: str | None = None) -> str | None:
@@ -362,38 +562,86 @@ def retrieval_metrics(mode: str, batch_id: str | None, top_k: int) -> dict[str, 
     return summary
 
 
-async def run_answer_eval_for_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def run_answer_eval_for_rows(
+    rows: list[dict[str, Any]],
+    retrieval_context_map: dict[str, list[str]],
+) -> list[dict[str, Any]]:
     rt = ensure_runtime()
-    OpenAI = rt["OpenAI"]
-    FaithfulnessEvaluator = rt["FaithfulnessEvaluator"]
-    CorrectnessEvaluator = rt["CorrectnessEvaluator"]
-    RelevancyEvaluator = rt["RelevancyEvaluator"]
+    AnswerRelevancyMetric = rt["AnswerRelevancyMetric"]
+    FaithfulnessMetric = rt["FaithfulnessMetric"]
+    LLMTestCase = rt["LLMTestCase"]
 
-    llm = OpenAI(
-        model=env_str("OPENAI_LLM_MODEL", "gpt-4.1-mini"),
-        api_key=env_str("OPENAI_API_KEY"),
-        api_base=env_str("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-    )
-    faith = FaithfulnessEvaluator(llm=llm)
-    correctness = CorrectnessEvaluator(llm=llm)
-    relevancy = RelevancyEvaluator(llm=llm)
+    model = build_deepeval_model()
+    model_name = evaluation_model_name()
+    out: list[dict[str, Any]] = []
 
-    out = []
     for row in rows:
-        contexts = [
-            item.get("text") or item.get("body", "")
-            for item in row["evidence_bundle"]
-        ]
-        reference_answer = "\n\n".join(contexts[:3]) if contexts else None
-        q = row["query_text"]
-        a = row["answer_text"]
+        direct_contexts = extract_contexts(row["evidence_bundle"])
+        fallback_contexts = retrieval_context_map.get(row["query_id"], [])
+        correctness_contexts = direct_contexts or fallback_contexts
+        reference_answer = reference_answer_from_contexts(correctness_contexts)
+
+        faithfulness_metric = FaithfulnessMetric(
+            threshold=FAITHFULNESS_THRESHOLD,
+            model=model,
+            async_mode=False,
+        )
+        relevancy_metric = AnswerRelevancyMetric(
+            threshold=ANSWER_RELEVANCY_THRESHOLD,
+            model=model,
+            async_mode=False,
+        )
+        correctness_metric = build_correctness_metric(model)
+
+        query_text = row["query_text"]
+        answer_text = row["answer_text"]
+
+        if direct_contexts:
+            faithfulness_case = LLMTestCase(
+                input=query_text,
+                actual_output=answer_text,
+                retrieval_context=direct_contexts,
+            )
+            faithfulness_payload = measure_metric(faithfulness_metric, faithfulness_case, model_name)
+        else:
+            faithfulness_payload = metric_error_payload(
+                threshold=FAITHFULNESS_THRESHOLD,
+                model_name=model_name,
+                error="No retrieval context available for grounding-based evaluation.",
+                score=0.0,
+                short_circuit=True,
+            )
+
+        relevancy_case = LLMTestCase(
+            input=query_text,
+            actual_output=answer_text,
+        )
+        relevancy_payload = measure_metric(relevancy_metric, relevancy_case, model_name)
+
+        if reference_answer:
+            correctness_case = LLMTestCase(
+                input=query_text,
+                actual_output=answer_text,
+                expected_output=reference_answer,
+            )
+            correctness_payload = measure_metric(correctness_metric, correctness_case, model_name)
+        else:
+            correctness_payload = metric_error_payload(
+                threshold=CORRECTNESS_THRESHOLD,
+                model_name=model_name,
+                error="No evidence-backed reference answer available for correctness evaluation.",
+                score=None,
+                short_circuit=True,
+            )
+
         out.append(
             {
                 "query_id": row["query_id"],
+                "query_text": query_text,
                 "mode": row["mode"],
-                "faithfulness": (await faith.aevaluate(query=q, response=a, contexts=contexts)).model_dump(),
-                "correctness": (await correctness.aevaluate(query=q, response=a, contexts=contexts, reference=reference_answer)).model_dump(),
-                "relevancy": (await relevancy.aevaluate(query=q, response=a, contexts=contexts)).model_dump(),
+                "faithfulness": faithfulness_payload,
+                "correctness": correctness_payload,
+                "relevancy": relevancy_payload,
             }
         )
     return out
@@ -418,7 +666,11 @@ def answer_eval(mode: str, batch_id: str | None, limit: int) -> dict[str, Any]:
         )
         rows = list(cur.fetchall())
 
-    eval_rows = asyncio.run(run_answer_eval_for_rows(rows))
+    retrieval_context_map = load_retrieval_contexts(
+        batch_id,
+        [row["query_id"] for row in rows if row.get("query_id")],
+    )
+    eval_rows = run_answer_eval_for_rows(rows, retrieval_context_map)
     out_path = RESULTS_DIR / f"answer_eval_{mode}.json"
     out_path.write_text(json.dumps(eval_rows, indent=2, ensure_ascii=True), encoding="utf-8")
 
@@ -451,8 +703,7 @@ def compare(left_mode: str, right_mode: str, batch_id: str | None, limit: int) -
     left_mode = normalize_answer_mode(left_mode)
     right_mode = normalize_answer_mode(right_mode)
     rt = ensure_runtime()
-    OpenAI = rt["OpenAI"]
-    PairwiseComparisonEvaluator = rt["PairwiseComparisonEvaluator"]
+    LLMTestCase = rt["LLMTestCase"]
     Jsonb = rt["Jsonb"]
 
     batch_id = batch_id or latest_batch_id("answer_runs", left_mode)
@@ -475,12 +726,13 @@ def compare(left_mode: str, right_mode: str, batch_id: str | None, limit: int) -
     for row in rows:
         by_query.setdefault(row["query_id"], {})[row["mode"]] = row
 
-    llm = OpenAI(
-        model=env_str("OPENAI_LLM_MODEL", "gpt-4.1-mini"),
-        api_key=env_str("OPENAI_API_KEY"),
-        api_base=env_str("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+    retrieval_context_map = load_retrieval_contexts(
+        batch_id,
+        [query_id for query_id in by_query if query_id],
     )
-    evaluator = PairwiseComparisonEvaluator(llm=llm)
+    model = build_deepeval_model()
+    model_name = evaluation_model_name()
+    evaluator = build_pairwise_metric(model)
     comparisons = []
     with connect() as conn, conn.cursor() as cur:
         for query_id, pair in list(by_query.items())[:limit]:
@@ -488,19 +740,27 @@ def compare(left_mode: str, right_mode: str, batch_id: str | None, limit: int) -
                 continue
             left = pair[left_mode]
             right = pair[right_mode]
-            result = asyncio.run(
-                evaluator.aevaluate(
-                    query=left["query_text"],
-                    response=left["answer_text"],
-                    second_response=right["answer_text"],
-                    reference="\n\n".join(
-                        item.get("text") or item.get("body", "")
-                        for item in left["evidence_bundle"][:3]
-                    ),
-                )
+            contexts = extract_contexts(left["evidence_bundle"]) or retrieval_context_map.get(query_id, [])
+            test_case = LLMTestCase(
+                input=left["query_text"],
+                actual_output=left["answer_text"],
+                expected_output=right["answer_text"],
+                retrieval_context=contexts,
             )
-            payload = result.model_dump()
-            comparisons.append({"query_id": query_id, "payload": payload})
+            payload = measure_metric(evaluator, test_case, model_name)
+            preferred_left = payload.get("passing")
+            comparisons.append(
+                {
+                    "query_id": query_id,
+                    "query_text": left["query_text"],
+                    "left_mode": left_mode,
+                    "right_mode": right_mode,
+                    "preferred_left": preferred_left,
+                    "score": payload.get("score"),
+                    "reasoning": payload.get("feedback"),
+                    "payload": {**payload, "preferred_left": preferred_left},
+                }
+            )
             cur.execute(
                 """
                 INSERT INTO comparison_runs (batch_id, query_id, left_mode, right_mode, preferred_left, score, reasoning, payload)
@@ -511,10 +771,10 @@ def compare(left_mode: str, right_mode: str, batch_id: str | None, limit: int) -
                     "query_id": query_id,
                     "left_mode": left_mode,
                     "right_mode": right_mode,
-                    "preferred_left": payload.get("passing"),
+                    "preferred_left": preferred_left,
                     "score": payload.get("score"),
                     "reasoning": payload.get("feedback"),
-                    "payload": Jsonb(payload),
+                    "payload": Jsonb({**payload, "preferred_left": preferred_left}),
                 },
             )
     (RESULTS_DIR / f"pairwise_{left_mode}_vs_{right_mode}.json").write_text(
@@ -563,7 +823,11 @@ def report() -> dict[str, Any]:
     if pairwise_path.exists():
         rows = json.loads(pairwise_path.read_text(encoding="utf-8"))
         if rows:
-            left_wins = sum(1 for row in rows if row["payload"].get("score") == 1.0)
+            left_wins = sum(
+                1
+                for row in rows
+                if row.get("preferred_left") is True or row.get("payload", {}).get("preferred_left") is True
+            )
             summaries["pairwise_hybrid_rag_vs_llm_only"] = {
                 "rows": len(rows),
                 "hybrid_rag_wins": left_wins,
@@ -620,7 +884,7 @@ def main() -> int:
     metrics.add_argument("--batch-id", default=None)
     metrics.add_argument("--top-k", type=int, default=10)
 
-    ans = sub.add_parser("answer-eval", help="Run answer-level evaluators with OpenAI judge.")
+    ans = sub.add_parser("answer-eval", help="Run answer-level evaluators with DeepEval.")
     ans.add_argument(
         "--mode",
         choices=["hybrid_rag", "hybrid-rag", "llm_only", "llm-only", "grounded", "closed-book"],
@@ -629,7 +893,7 @@ def main() -> int:
     ans.add_argument("--batch-id", default=None)
     ans.add_argument("--limit", type=int, default=10)
 
-    comp = sub.add_parser("compare", help="Run pairwise comparison between two answer modes.")
+    comp = sub.add_parser("compare", help="Run DeepEval-based pairwise comparison between two answer modes.")
     comp.add_argument("--left-mode", default="hybrid_rag")
     comp.add_argument("--right-mode", default="llm_only")
     comp.add_argument("--batch-id", default=None)

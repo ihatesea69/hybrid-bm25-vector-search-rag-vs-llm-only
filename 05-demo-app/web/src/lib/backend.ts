@@ -1,4 +1,4 @@
-import type { HealthPayload, KbSummary, SummaryPayload } from "@/lib/types";
+import type { HealthPayload, KbSummary, PhaseSnapshotPayload, SummaryPayload } from "@/lib/types";
 
 const BACKEND_BASE_URL = process.env.MEDIR_DEMO_API_URL ?? "http://127.0.0.1:8008";
 
@@ -48,5 +48,12 @@ export function getDemoSummarySnapshot(): Promise<SummaryPayload> {
   return safeJson<SummaryPayload>("/demo/summary", {
     summary: {},
     failure_cases: {},
+  });
+}
+
+export function getDemoPhasesSnapshot(): Promise<PhaseSnapshotPayload> {
+  return safeJson<PhaseSnapshotPayload>("/demo/phases", {
+    updatedAt: new Date(0).toISOString(),
+    phases: [],
   });
 }

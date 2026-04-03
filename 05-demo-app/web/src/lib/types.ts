@@ -19,6 +19,26 @@ export type SummaryPayload = {
   failure_cases: Record<string, Array<Record<string, unknown>>>;
 };
 
+export type PhaseStat = {
+  label: string;
+  value: string;
+};
+
+export type PhaseDetail = {
+  id: string;
+  title: string;
+  summary: string;
+  status: "ready" | "partial" | "degraded";
+  stats: PhaseStat[];
+  outputs: string[];
+  details: string[];
+};
+
+export type PhaseSnapshotPayload = {
+  updatedAt: string;
+  phases: PhaseDetail[];
+};
+
 export type KbSummary = {
   status: "ok" | "degraded";
   documents: number;
@@ -47,6 +67,10 @@ export type DemoResultRow = {
   score: number;
   snippet: string;
   sectionType?: string;
+  retrievalPath?: string;
+  bm25Meta?: Record<string, unknown> | null;
+  vectorMeta?: Record<string, unknown> | null;
+  rerankerMeta?: Record<string, unknown> | null;
 };
 
 export type Citation = {

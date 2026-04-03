@@ -4,11 +4,13 @@ import Link from "next/link";
 import { useDeferredValue, useEffect, useEffectEvent, useRef, useState, useTransition } from "react";
 import { useSearchParams } from "next/navigation";
 
+import { PhaseOverview } from "@/components/phase-overview";
 import { StatusPill } from "@/components/status-pill";
-import type { Citation, DemoQueryPayload, DemoResultRow, KbSummary } from "@/lib/types";
+import type { Citation, DemoQueryPayload, DemoResultRow, KbSummary, PhaseDetail } from "@/lib/types";
 
 type DemoClientProps = {
   initialKbSummary: KbSummary;
+  initialPhases: PhaseDetail[];
   sampleQueries: string[];
 };
 
@@ -22,6 +24,20 @@ function CitationRow({ citation }: { citation: Citation }) {
 }
 
 function EvidenceCard({ row, index }: { row: DemoResultRow; index: number }) {
+  const rerankerModel =
+    typeof row.rerankerMeta?.model === "string" ? row.rerankerMeta.model : undefined;
+  const bm25Rank =
+    typeof row.bm25Meta?.rerankRank === "number"
+      ? row.bm25Meta.rerankRank
+      : typeof row.bm25Meta?.originalRank === "number"
+        ? row.bm25Meta.originalRank
+        : undefined;
+  const vectorRank =
+    typeof row.vectorMeta?.rerankRank === "number"
+      ? row.vectorMeta.rerankRank
+      : typeof row.vectorMeta?.originalRank === "number"
+        ? row.vectorMeta.originalRank
+        : undefined;
   return (
     <article className="rounded-[24px] border border-white/10 bg-slate-950/45 p-5">
       <div className="flex items-start justify-between gap-3">
@@ -35,6 +51,22 @@ function EvidenceCard({ row, index }: { row: DemoResultRow; index: number }) {
         </div>
       </div>
       <p className="mt-4 text-sm leading-7 text-slate-200/78">{row.snippet || "No snippet available."}</p>
+      <div className="mt-4 flex flex-wrap gap-2 text-xs text-slate-300/72">
+        {row.retrievalPath ? (
+          <span className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1">Path: {row.retrievalPath}</span>
+        ) : null}
+        {typeof bm25Rank === "number" ? (
+          <span className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1">BM25 rank: {bm25Rank}</span>
+        ) : null}
+        {typeof vectorRank === "number" ? (
+          <span className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1">Vector rank: {vectorRank}</span>
+        ) : null}
+        {rerankerModel ? (
+          <span className="rounded-full border border-cyan-300/20 bg-cyan-400/[0.07] px-3 py-1 text-cyan-100">
+            Reranker: {rerankerModel}
+          </span>
+        ) : null}
+      </div>
     </article>
   );
 }
@@ -71,7 +103,7 @@ function AnswerPanel({
   );
 }
 
-export function DemoClient({ initialKbSummary, sampleQueries }: DemoClientProps) {
+export function DemoClient({ initialKbSummary, initialPhases, sampleQueries }: DemoClientProps) {
   const searchParams = useSearchParams();
   const seededQuery = searchParams.get("q") ?? sampleQueries[0] ?? "";
   const autorun = searchParams.get("autorun") === "1";
@@ -229,6 +261,21 @@ export function DemoClient({ initialKbSummary, sampleQueries }: DemoClientProps)
             ))}
           </div>
         </aside>
+      </section>
+
+      <section className="rounded-[32px] border border-white/10 bg-white/[0.045] p-6">
+        <div className="flex flex-wrap items-end justify-between gap-4">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-[0.28em] text-cyan-100/64">Pipeline breakdown</p>
+            <h2 className="mt-3 text-3xl font-semibold text-white">Chi tiết từng phase ngay trong workbench</h2>
+          </div>
+          <span className="rounded-full border border-white/10 bg-white/[0.04] px-4 py-2 text-sm text-slate-200/72">
+            Dùng để giải thích flow khi demo live query
+          </span>
+        </div>
+        <div className="mt-6">
+          <PhaseOverview phases={initialPhases} compact />
+        </div>
       </section>
 
       {result ? (

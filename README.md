@@ -48,6 +48,7 @@ The retrieval layer uses:
 - BM25 in PostgreSQL through `pg_textsearch`
 - vector retrieval in PostgreSQL through `pgvector`
 - reciprocal rank fusion for hybrid ranking
+- optional Cohere reranking on BM25/vector branches before final fusion
 
 ## Requirements
 
@@ -64,6 +65,18 @@ Copy-Item .env.example .env
 ```
 
 Then fill in `OPENAI_API_KEY` in `.env`.
+
+Optional reranker settings:
+
+```powershell
+RERANKER_ENABLED=false
+RERANKER_PROVIDER=cohere
+COHERE_API_KEY=
+COHERE_RERANK_MODEL=rerank-v4.0-fast
+RERANKER_CANDIDATE_K=20
+```
+
+When reranking is enabled, the system reranks BM25 and vector candidates independently and then fuses the reranked branch orders with RRF. If the Cohere API is unavailable, the retrieval flow falls back to the original BM25 + vector + RRF pipeline.
 
 ## Quick start
 

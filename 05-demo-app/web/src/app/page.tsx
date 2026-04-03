@@ -2,9 +2,10 @@ import Link from "next/link";
 
 import { FailureCaseList } from "@/components/failure-case-list";
 import { MetricCard } from "@/components/metric-card";
+import { PhaseOverview } from "@/components/phase-overview";
 import { QueryExamples } from "@/components/query-examples";
 import { StatusPill } from "@/components/status-pill";
-import { getDemoSummarySnapshot, getHealthSnapshot, getKbSummarySnapshot } from "@/lib/backend";
+import { getDemoPhasesSnapshot, getDemoSummarySnapshot, getHealthSnapshot, getKbSummarySnapshot } from "@/lib/backend";
 import { sampleQueries } from "@/lib/demo-data";
 
 function formatMetric(value: number | undefined, digits = 3) {
@@ -12,10 +13,11 @@ function formatMetric(value: number | undefined, digits = 3) {
 }
 
 export default async function HomePage() {
-  const [health, kbSummary, demoSummary] = await Promise.all([
+  const [health, kbSummary, demoSummary, phaseSnapshot] = await Promise.all([
     getHealthSnapshot(),
     getKbSummarySnapshot(),
     getDemoSummarySnapshot(),
+    getDemoPhasesSnapshot(),
   ]);
 
   const retrieval = demoSummary.summary.retrieval_hybrid;
@@ -60,6 +62,21 @@ export default async function HomePage() {
         <MetricCard eyebrow="BM25 + Vector" value={kbSummary.availableModes.join(" · ")} note="Các mode hiện có của phase 3 runtime." />
         <MetricCard eyebrow="Faithfulness" value={formatMetric(hybridRag?.faithfulness, 2)} note="Judge score của grounded answer trên evidence hiện có." />
         <MetricCard eyebrow="LLM-only relevancy" value={formatMetric(llmOnly?.relevancy, 2)} note="Mức liên quan khi trả lời không dùng retrieval context." />
+      </section>
+
+      <section className="rounded-[32px] border border-white/10 bg-white/[0.045] p-6">
+        <div className="flex flex-wrap items-end justify-between gap-4">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-[0.28em] text-cyan-100/64">Pipeline breakdown</p>
+            <h2 className="mt-3 text-3xl font-semibold text-white">Chi tiết từng phase của hệ thống</h2>
+          </div>
+          <span className="rounded-full border border-white/10 bg-white/[0.04] px-4 py-2 text-sm text-slate-200/72">
+            Snapshot at {new Date(phaseSnapshot.updatedAt).toLocaleString("vi-VN")}
+          </span>
+        </div>
+        <div className="mt-6">
+          <PhaseOverview phases={phaseSnapshot.phases} />
+        </div>
       </section>
 
       <section className="grid gap-8 lg:grid-cols-[1.1fr_0.9fr]">

@@ -40,12 +40,18 @@ BENCHMARK_QUERIES = PHASE2 / "benchmark_queries.jsonl"
 QRELS_TEST = PHASE2 / "benchmark_qrels_test.tsv"
 
 PACKAGE_TO_MODULE = {
+    "cohere": "cohere",
     "psycopg[binary]": "psycopg",
     "python-dotenv": "dotenv",
     "llama-index": "llama_index",
     "llama-index-embeddings-openai": "llama_index.embeddings.openai",
     "llama-index-llms-openai": "llama_index.llms.openai",
 }
+
+DEFAULT_RERANKER_PROVIDER = "cohere"
+DEFAULT_COHERE_RERANK_MODEL = "rerank-v4.0-fast"
+DEFAULT_RERANKER_CANDIDATE_K = 20
+DEFAULT_COHERE_MAX_TOKENS_PER_DOC = 2000
 
 
 def parse_env_file(path: Path) -> dict[str, str]:
@@ -67,6 +73,23 @@ PROJECT_ENV = parse_env_file(ENV_FILE)
 def env_str(name: str, default: str | None = None) -> str | None:
     value = PROJECT_ENV.get(name, os.environ.get(name, default))
     return value.strip() if isinstance(value, str) else value
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = env_str(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def env_int(name: str, default: int) -> int:
+    value = env_str(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
 
 
 def db_url() -> str:
@@ -96,7 +119,7 @@ def venv_has_runtime_modules() -> bool:
     if not VENV_PYTHON.exists():
         return False
     probe = (
-        "import dotenv, psycopg, llama_index; "
+        "import cohere, dotenv, psycopg, llama_index; "
         "import llama_index.embeddings.openai, llama_index.llms.openai"
     )
     result = subprocess.run(
@@ -177,6 +200,7 @@ def bootstrap() -> None:
 def ensure_runtime():
     ensure_running_in_local_venv()
     activate_local_site_packages(install_missing=True)
+    import cohere
     from dotenv import load_dotenv
     from llama_index.embeddings.openai import OpenAIEmbedding
     from llama_index.llms.openai import OpenAI
@@ -186,6 +210,7 @@ def ensure_runtime():
 
     load_dotenv(ENV_FILE, override=False)
     return {
+        "cohere": cohere,
         "OpenAIEmbedding": OpenAIEmbedding,
         "OpenAI": OpenAI,
         "psycopg": psycopg,
@@ -243,6 +268,191 @@ def normalize_answer_mode(mode: str) -> str:
         "llm_only": "llm_only",
     }
     return aliases.get(mode, mode)
+
+
+def reranker_enabled() -> bool:
+    return env_bool("RERANKER_ENABLED", default=False)
+
+
+def reranker_provider() -> str:
+    return (env_str("RERANKER_PROVIDER", DEFAULT_RERANKER_PROVIDER) or DEFAULT_RERANKER_PROVIDER).lower()
+
+
+def reranker_candidate_k() -> int:
+    return max(env_int("RERANKER_CANDIDATE_K", DEFAULT_RERANKER_CANDIDATE_K), 1)
+
+
+def cohere_rerank_model() -> str:
+    return env_str("COHERE_RERANK_MODEL", DEFAULT_COHERE_RERANK_MODEL) or DEFAULT_COHERE_RERANK_MODEL
+
+
+def cohere_max_tokens_per_doc() -> int:
+    return max(env_int("COHERE_MAX_TOKENS_PER_DOC", DEFAULT_COHERE_MAX_TOKENS_PER_DOC), 1)
+
+
+def reranker_base_config() -> dict[str, Any]:
+    enabled = reranker_enabled()
+    provider = reranker_provider()
+    config: dict[str, Any] = {
+        "enabled": enabled,
+        "provider": provider,
+        "candidate_k": reranker_candidate_k(),
+    }
+    if provider == "cohere":
+        config["model"] = cohere_rerank_model()
+    return config
+
+
+def format_rerank_document(row: dict[str, Any]) -> str:
+    title = str(row.get("title") or row.get("doc_id") or "").strip()
+    body = str(row.get("body") or "").strip()
+    if title and body:
+        return f"Title: {title}\n\nBody: {body}"
+    return title or body
+
+
+def build_cohere_client():
+    api_key = env_str("COHERE_API_KEY")
+    if not api_key:
+        raise RuntimeError("COHERE_API_KEY is required when reranker is enabled.")
+    rt = ensure_runtime()
+    CohereClientV2 = rt["cohere"].ClientV2
+    base_url = env_str("COHERE_BASE_URL")
+    kwargs: dict[str, Any] = {"api_key": api_key}
+    if base_url:
+        kwargs["base_url"] = base_url
+    return CohereClientV2(**kwargs)
+
+
+def attach_branch_metadata(
+    rows: list[dict[str, Any]],
+    *,
+    branch_name: str,
+    retrieval_path: str,
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for rank, row in enumerate(rows, start=1):
+        branch_meta = {
+            "original_rank": rank,
+            "original_score": float(row.get("score", 0.0)),
+            "rerank_rank": rank,
+            "rerank_score": None,
+            "provider": None,
+            "model": None,
+            "applied": False,
+            "fallback": False,
+            "error": None,
+        }
+        out.append(
+            {
+                **row,
+                "retrieval_path": retrieval_path,
+                f"{branch_name}_meta": branch_meta,
+                "reranker_meta": {
+                    "provider": None,
+                    "model": None,
+                    "candidate_k": len(rows),
+                    "enabled": False,
+                    "applied": False,
+                    "branch": branch_name,
+                },
+            }
+        )
+    return out
+
+
+def rerank_branch_rows(
+    query_text: str,
+    rows: list[dict[str, Any]],
+    *,
+    branch_name: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    base_config = reranker_base_config()
+    branch_config: dict[str, Any] = {
+        "branch": branch_name,
+        "provider": base_config["provider"],
+        "model": base_config.get("model"),
+        "candidate_k": len(rows),
+        "enabled": base_config["enabled"],
+        "applied": False,
+        "fallback": False,
+        "error": None,
+    }
+    retrieval_path = "hybrid"
+    prepared_rows = attach_branch_metadata(rows, branch_name=branch_name, retrieval_path=retrieval_path)
+    if not rows or not base_config["enabled"]:
+        return prepared_rows, branch_config
+
+    if base_config["provider"] != "cohere":
+        branch_config["fallback"] = True
+        branch_config["error"] = f"Unsupported reranker provider: {base_config['provider']}"
+        return prepared_rows, branch_config
+
+    try:
+        client = build_cohere_client()
+        response = client.rerank(
+            model=cohere_rerank_model(),
+            query=query_text,
+            documents=[format_rerank_document(row) for row in rows],
+            top_n=len(rows),
+            max_tokens_per_doc=cohere_max_tokens_per_doc(),
+        )
+        reranked_rows: list[dict[str, Any]] = []
+        for rerank_rank, item in enumerate(response.results, start=1):
+            source_row = prepared_rows[item.index]
+            branch_meta = {
+                "original_rank": source_row[f"{branch_name}_meta"]["original_rank"],
+                "original_score": float(source_row.get("score", 0.0)),
+                "rerank_rank": rerank_rank,
+                "rerank_score": float(item.relevance_score),
+                "provider": "cohere",
+                "model": cohere_rerank_model(),
+                "applied": True,
+                "fallback": False,
+                "error": None,
+            }
+            reranked_rows.append(
+                {
+                    **source_row,
+                    "retrieval_path": "hybrid_rerank",
+                    f"{branch_name}_meta": branch_meta,
+                    "reranker_meta": {
+                        "provider": "cohere",
+                        "model": cohere_rerank_model(),
+                        "candidate_k": len(rows),
+                        "enabled": True,
+                        "applied": True,
+                        "branch": branch_name,
+                    },
+                }
+            )
+        branch_config.update({"applied": True})
+        return reranked_rows, branch_config
+    except Exception as exc:
+        branch_config["fallback"] = True
+        branch_config["error"] = str(exc)
+        fallback_rows: list[dict[str, Any]] = []
+        for row in prepared_rows:
+            branch_meta = dict(row[f"{branch_name}_meta"])
+            branch_meta["fallback"] = True
+            branch_meta["error"] = str(exc)
+            fallback_rows.append(
+                {
+                    **row,
+                    f"{branch_name}_meta": branch_meta,
+                    "reranker_meta": {
+                        "provider": "cohere",
+                        "model": cohere_rerank_model(),
+                        "candidate_k": len(rows),
+                        "enabled": True,
+                        "applied": False,
+                        "branch": branch_name,
+                        "fallback": True,
+                        "error": str(exc),
+                    },
+                }
+            )
+        return fallback_rows, branch_config
 
 
 def load_documents() -> list[dict[str, Any]]:
@@ -421,23 +631,98 @@ def vector_rows(query_text: str, top_k: int) -> list[dict[str, Any]]:
         return dedupe_rows_by_doc(list(cur.fetchall()), top_k=top_k)
 
 
+def merge_result_metadata(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(existing)
+    for key in ("bm25_meta", "vector_meta"):
+        if incoming.get(key) is not None:
+            merged[key] = incoming[key]
+    incoming_reranker = incoming.get("reranker_meta") or {}
+    existing_reranker = merged.get("reranker_meta")
+    if not isinstance(existing_reranker, dict):
+        merged["reranker_meta"] = incoming_reranker
+    elif incoming_reranker.get("enabled"):
+        merged["reranker_meta"] = {**existing_reranker, **incoming_reranker}
+    if incoming.get("retrieval_path") == "hybrid_rerank":
+        merged["retrieval_path"] = "hybrid_rerank"
+    return merged
+
+
 def rrf_fuse(*ranked_lists: list[dict[str, Any]], top_k: int, k: int = 60) -> list[dict[str, Any]]:
     scores: dict[str, dict[str, Any]] = {}
     for rank_list in ranked_lists:
         for rank, row in enumerate(rank_list, start=1):
             node_id = row["node_id"]
             payload = scores.setdefault(node_id, {"row": row, "score": 0.0})
+            payload["row"] = merge_result_metadata(payload["row"], row)
             payload["score"] += 1.0 / (k + rank)
     fused = sorted(scores.values(), key=lambda item: item["score"], reverse=True)
     return dedupe_rows_by_doc([{**item["row"], "score": item["score"]} for item in fused], top_k=top_k)
 
 
-def hybrid_rows(query_text: str, top_k: int) -> list[dict[str, Any]]:
-    return rrf_fuse(
-        bm25_rows(query_text, top_k * 4),
-        vector_rows(query_text, top_k * 4),
+def hybrid_search(query_text: str, top_k: int) -> dict[str, Any]:
+    base_config = reranker_base_config()
+    if not base_config["enabled"]:
+        results = rrf_fuse(
+            bm25_rows(query_text, top_k * 4),
+            vector_rows(query_text, top_k * 4),
+            top_k=top_k,
+        )
+        return {
+            "results": results,
+            "config": {
+                "top_k": top_k,
+                "candidate_k": None,
+                "reranker": {
+                    **base_config,
+                    "bm25": {
+                        "branch": "bm25",
+                        "enabled": False,
+                        "applied": False,
+                        "fallback": False,
+                        "error": None,
+                    },
+                    "vector": {
+                        "branch": "vector",
+                        "enabled": False,
+                        "applied": False,
+                        "fallback": False,
+                        "error": None,
+                    },
+                    "final_retrieval_path": "hybrid",
+                },
+            },
+        }
+
+    candidate_k = max(top_k, base_config["candidate_k"])
+    bm25_candidates = bm25_rows(query_text, candidate_k)
+    vector_candidates = vector_rows(query_text, candidate_k)
+    bm25_results, bm25_config = rerank_branch_rows(query_text, bm25_candidates, branch_name="bm25")
+    vector_results, vector_config = rerank_branch_rows(query_text, vector_candidates, branch_name="vector")
+    fused = rrf_fuse(
+        bm25_results,
+        vector_results,
         top_k=top_k,
     )
+    retrieval_path = "hybrid_rerank" if bm25_config["applied"] or vector_config["applied"] else "hybrid"
+    for row in fused:
+        row["retrieval_path"] = retrieval_path if row.get("retrieval_path") == "hybrid_rerank" else row.get("retrieval_path", retrieval_path)
+    return {
+        "results": fused,
+        "config": {
+            "top_k": top_k,
+            "candidate_k": candidate_k,
+            "reranker": {
+                **base_config,
+                "bm25": bm25_config,
+                "vector": vector_config,
+                "final_retrieval_path": retrieval_path,
+            },
+        },
+    }
+
+
+def hybrid_rows(query_text: str, top_k: int) -> list[dict[str, Any]]:
+    return hybrid_search(query_text, top_k)["results"]
 
 
 def llm_complete(prompt: str) -> str:
@@ -566,7 +851,8 @@ def run_query(
     batch_id = str(uuid.uuid4())
 
     if canonical == "hybrid":
-        results = hybrid_rows(query_text, top_k)
+        search = hybrid_search(query_text, top_k)
+        results = search["results"]
         payload = {
             "batch_id": batch_id,
             "mode": "hybrid",
@@ -574,7 +860,7 @@ def run_query(
             "results": results,
         }
         if save_run:
-            insert_retrieval_run(batch_id, "hybrid", query_id, query_text, results, {"top_k": top_k})
+            insert_retrieval_run(batch_id, "hybrid", query_id, query_text, results, search["config"])
         return payload
 
     if canonical == "hybrid_rag":
@@ -597,7 +883,7 @@ def run_query(
                 answer_text,
                 citations,
                 retrieval["results"],
-                {"top_k": top_k},
+                {"top_k": top_k, "retrieval_mode": "hybrid"},
             )
         return payload
 
@@ -627,10 +913,11 @@ def run_demo_bundle(
     total_started = perf_counter()
 
     hybrid_started = perf_counter()
-    hybrid_results = hybrid_rows(query_text, top_k)
+    hybrid_search_payload = hybrid_search(query_text, top_k)
+    hybrid_results = hybrid_search_payload["results"]
     timings_ms["hybrid"] = round((perf_counter() - hybrid_started) * 1000, 2)
     if save_run:
-        insert_retrieval_run(batch_id, "hybrid", query_id, query_text, hybrid_results, {"top_k": top_k})
+        insert_retrieval_run(batch_id, "hybrid", query_id, query_text, hybrid_results, hybrid_search_payload["config"])
 
     rag_started = perf_counter()
     rag_answer, rag_citations = hybrid_rag_answer(query_text, hybrid_results)
@@ -644,7 +931,7 @@ def run_demo_bundle(
             rag_answer,
             rag_citations,
             hybrid_results,
-            {"top_k": top_k},
+            {"top_k": top_k, "retrieval_mode": "hybrid"},
         )
 
     llm_started = perf_counter()
@@ -686,8 +973,8 @@ def batch(limit: int, top_k: int, include_unjudged: bool) -> dict[str, Any]:
         query_id = row.get("_id") or row.get("id") or row.get("query_id")
         query_text = row.get("text") or row.get("query") or ""
 
-        hybrid = run_query("hybrid", query_text, top_k=top_k, query_id=query_id, save_run=False)
-        insert_retrieval_run(batch_id, "hybrid", query_id, query_text, hybrid["results"], {"top_k": top_k})
+        hybrid = hybrid_search(query_text, top_k)
+        insert_retrieval_run(batch_id, "hybrid", query_id, query_text, hybrid["results"], hybrid["config"])
 
         rag_answer, rag_citations = hybrid_rag_answer(query_text, hybrid["results"])
         insert_answer_run(
@@ -698,7 +985,7 @@ def batch(limit: int, top_k: int, include_unjudged: bool) -> dict[str, Any]:
             rag_answer,
             rag_citations,
             hybrid["results"],
-            {"top_k": top_k},
+            {"top_k": top_k, "retrieval_mode": "hybrid"},
         )
 
         llm_answer = llm_only_answer(query_text)

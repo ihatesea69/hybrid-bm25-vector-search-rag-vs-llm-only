@@ -8,6 +8,8 @@ datasets
 networkx
 numpy
 openai
+deepeval
+cohere
 pypdf
 psycopg[binary]
 python-dotenv

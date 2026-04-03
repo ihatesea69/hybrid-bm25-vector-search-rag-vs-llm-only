@@ -157,6 +157,22 @@ def test_health_and_failure_cases_survive_missing_artifacts():
     assert failures.json() == {}
 
 
+def test_demo_phases_exposes_phase_by_phase_snapshot():
+    module = build_module()
+    client = TestClient(module.app)
+
+    response = client.get("/demo/phases")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert "updatedAt" in payload
+    assert len(payload["phases"]) == 4
+    assert payload["phases"][0]["id"] == "phase1"
+    assert payload["phases"][1]["id"] == "phase2"
+    assert payload["phases"][2]["id"] == "phase3"
+    assert payload["phases"][3]["id"] == "phase4"
+
+
 def test_runtime_helpers_are_exposed_for_demo_backend():
     retrieval_spec = importlib.util.spec_from_file_location(
         "medir_phase3_retrieval_smoke",
