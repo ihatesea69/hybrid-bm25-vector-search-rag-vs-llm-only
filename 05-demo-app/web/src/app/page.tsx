@@ -21,9 +21,11 @@ export default async function HomePage() {
   ]);
 
   const retrieval = demoSummary.summary.retrieval_hybrid;
+  const contextualRetrieval = demoSummary.summary.retrieval_contextual_hybrid;
   const hybridRag = demoSummary.summary.answer_hybrid_rag;
+  const contextualHybridRag = demoSummary.summary.answer_contextual_hybrid_rag;
   const llmOnly = demoSummary.summary.answer_llm_only;
-  const pairwise = demoSummary.summary.pairwise_hybrid_rag_vs_llm_only;
+  const contextualVsHybrid = demoSummary.summary.pairwise_contextual_hybrid_rag_vs_hybrid_rag;
 
   return (
     <main className="mx-auto flex min-h-screen w-full max-w-7xl flex-col gap-10 px-6 py-8 md:px-10 md:py-12">
@@ -31,12 +33,12 @@ export default async function HomePage() {
         <div className="grid gap-10 lg:grid-cols-[1.1fr_0.9fr]">
           <div>
             <StatusPill ok={health.ok} label={health.ok ? "System ready" : "System degraded"} />
-            <p className="mt-6 text-sm font-semibold uppercase tracking-[0.32em] text-cyan-100/64">MedIR benchmark demo</p>
+            <p className="mt-6 text-sm font-semibold uppercase tracking-[0.32em] text-cyan-100/64">Đề tài đồ án</p>
             <h1 className="mt-4 max-w-4xl text-5xl font-semibold tracking-tight text-white md:text-7xl">
-              Biến pipeline IR/RAG thành một demo app đủ sắc để thuyết trình.
+              Hybrid BM25 + Vector Search RAG vs LLM-only cho truy hồi và hỏi đáp dinh dưỡng.
             </h1>
             <p className="mt-6 max-w-3xl text-base leading-8 text-slate-200/72">
-              Lớp demo này trình bày cùng lúc retrieval evidence, grounded answer và closed-book answer trên knowledge base nutrition-health hiện có. Đây là demo phục vụ học thuật, không thay thế tư vấn y khoa chuyên môn.
+              Giao diện này trực quan hóa toàn bộ pipeline của đề tài: xây dựng knowledge base, indexing, hybrid retrieval, answer generation và evaluation trên tập dữ liệu nutrition-health hiện có. Hệ thống phục vụ mục tiêu học thuật và minh họa thực nghiệm, không thay thế tư vấn y khoa chuyên môn.
             </p>
 
             <div className="mt-8 flex flex-wrap gap-3">
@@ -44,23 +46,23 @@ export default async function HomePage() {
                 Mở live demo
               </Link>
               <span className="rounded-full border border-white/10 bg-white/[0.05] px-5 py-3 text-sm text-slate-200/75">
-                {kbSummary.documents} docs indexed · {kbSummary.embeddedNodes} nodes embedded
+                {kbSummary.documents} docs indexed · {kbSummary.embeddedNodes} raw embeds · {kbSummary.contextualEmbeddedNodes} contextual embeds
               </span>
             </div>
           </div>
 
           <div className="grid gap-4 sm:grid-cols-2">
             <MetricCard eyebrow="Retrieval recall@10" value={formatMetric(retrieval?.["recall@10"])} note="Hiệu quả thu hồi trên batch đánh giá gần nhất." />
-            <MetricCard eyebrow="Retrieval mrr@10" value={formatMetric(retrieval?.["mrr@10"])} note="Xếp hạng tài liệu liên quan đầu tiên." />
+            <MetricCard eyebrow="Contextual recall@10" value={formatMetric(contextualRetrieval?.["recall@10"])} note="Recall của contextual chunk retrieval." />
             <MetricCard eyebrow="Hybrid RAG correctness" value={formatMetric(hybridRag?.correctness, 2)} note="Điểm judge cho câu trả lời grounded." />
-            <MetricCard eyebrow="Pairwise win rate" value={formatMetric(pairwise?.hybrid_rag_win_rate, 2)} note="Tỉ lệ Hybrid RAG thắng LLM-only ở pairwise compare." />
+            <MetricCard eyebrow="Contextual vs Hybrid" value={formatMetric(contextualVsHybrid?.left_win_rate, 2)} note="Tỉ lệ contextual_hybrid_rag thắng hybrid_rag." />
           </div>
         </div>
       </section>
 
       <section className="grid gap-5 md:grid-cols-3">
         <MetricCard eyebrow="BM25 + Vector" value={kbSummary.availableModes.join(" · ")} note="Các mode hiện có của phase 3 runtime." />
-        <MetricCard eyebrow="Faithfulness" value={formatMetric(hybridRag?.faithfulness, 2)} note="Judge score của grounded answer trên evidence hiện có." />
+        <MetricCard eyebrow="Faithfulness" value={formatMetric(contextualHybridRag?.faithfulness, 2)} note="Judge score của contextual grounded answer." />
         <MetricCard eyebrow="LLM-only relevancy" value={formatMetric(llmOnly?.relevancy, 2)} note="Mức liên quan khi trả lời không dùng retrieval context." />
       </section>
 
@@ -110,8 +112,8 @@ export default async function HomePage() {
       </section>
 
       <section className="grid gap-6 lg:grid-cols-2">
-        <FailureCaseList title="Retrieval Hybrid" rows={demoSummary.failure_cases.retrieval_hybrid ?? []} />
-        <FailureCaseList title="Hybrid RAG" rows={demoSummary.failure_cases.answer_hybrid_rag ?? []} />
+        <FailureCaseList title="Contextual Retrieval" rows={demoSummary.failure_cases.retrieval_contextual_hybrid ?? []} />
+        <FailureCaseList title="Contextual Hybrid RAG" rows={demoSummary.failure_cases.answer_contextual_hybrid_rag ?? []} />
       </section>
     </main>
   );

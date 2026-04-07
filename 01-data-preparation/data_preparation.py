@@ -9,7 +9,6 @@ import site
 import subprocess
 import sys
 import unicodedata
-from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -348,73 +347,21 @@ def make_record(
     *,
     doc_id: str,
     source_id: str,
-    source_kind: str,
     title: str,
     source_url: str,
     content: str,
-    mime_type: str,
     matched_keywords: list[str] | None = None,
 ) -> dict[str, Any]:
+    keywords = matched_keywords or []
     return {
         "doc_id": doc_id,
         "source_id": source_id,
-        "source_kind": source_kind,
         "title": title,
         "source_url": source_url,
         "content": content,
-        "mime_type": mime_type,
-        "matched_keywords": matched_keywords or [],
-        "language": "en",
+        "matched_keywords": keywords,
+        "section_type": slug(keywords[0]) if keywords else None,
     }
-
-SOURCE_METADATA = {
-    "beir_nfcorpus": {
-        "source_name": "BEIR NFCorpus",
-        "issuing_unit": "BeIR / University of Heidelberg",
-        "source_type": "benchmark",
-        "applicable_audience": "research",
-        "update_frequency": "one_shot",
-    },
-    "medlineplus_nutrition": {
-        "source_name": "MedlinePlus Nutrition",
-        "issuing_unit": "U.S. National Library of Medicine",
-        "source_type": "health_topic",
-        "applicable_audience": "general_public",
-        "update_frequency": "periodic",
-    },
-    "fda_nutrition_facts_label": {
-        "source_name": "FDA Nutrition Facts Label Guide",
-        "issuing_unit": "U.S. Food and Drug Administration",
-        "source_type": "guideline",
-        "applicable_audience": "general_public",
-        "update_frequency": "periodic",
-    },
-    "fda_daily_value": {
-        "source_name": "FDA Daily Value on the Nutrition Facts Label",
-        "issuing_unit": "U.S. Food and Drug Administration",
-        "source_type": "guideline",
-        "applicable_audience": "general_public",
-        "update_frequency": "periodic",
-    },
-    "fda_label_pdf": {
-        "source_name": "FDA Nutrition Facts Label PDF",
-        "issuing_unit": "U.S. Food and Drug Administration",
-        "source_type": "pdf_guide",
-        "applicable_audience": "general_public",
-        "update_frequency": "periodic",
-    },
-    "pubmed_nutrition": {
-        "source_name": "PubMed Nutrition Articles",
-        "issuing_unit": "U.S. National Library of Medicine",
-        "source_type": "journal",
-        "applicable_audience": "research",
-        "update_frequency": "periodic",
-    },
-}
-
-
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
 def activate_local_site_packages(install_missing: bool) -> Path:
@@ -486,11 +433,9 @@ def build_nfcorpus_nutrition(force: bool) -> list[dict]:
             make_record(
                 doc_id=str(item["_id"]),
                 source_id="beir_nfcorpus",
-                source_kind="benchmark",
                 title=title,
                 source_url="https://huggingface.co/datasets/BeIR/nfcorpus",
                 content=content,
-                mime_type="text/plain",
                 matched_keywords=matched,
             )
         )
@@ -507,14 +452,13 @@ def normalize_pubmed_kb(force: bool) -> list[dict]:
     if not rows:
         return []
 
-    already_normalized = all("structure" in row and "metadata" in row and "lifecycle" in row for row in rows)
+    already_normalized = all("section_type" in row for row in rows)
     if already_normalized and not force:
         return rows
 
     normalized_rows: list[dict] = []
-    collected_at = utc_now_iso()
 
-    for order_idx, row in enumerate(rows, start=1):
+    for row in rows:
         doc_id = row.get("doc_id") or row.get("_id")
         title = normalize_text(row.get("title", "")) or str(doc_id)
         content = normalize_text(row.get("content") or row.get("text") or "")
@@ -529,42 +473,11 @@ def normalize_pubmed_kb(force: bool) -> list[dict]:
             {
                 "doc_id": doc_id,
                 "source_id": "pubmed_nutrition",
-                "source_kind": "pubmed",
                 "title": title,
                 "source_url": source_url,
                 "content": content,
-                "mime_type": "text/plain",
                 "matched_keywords": matched,
-                "language": "en",
-                "structure": {
-                    "parent_source_id": "source::pubmed_nutrition",
-                    "relation_type": "source_document",
-                    "order_idx": order_idx,
-                    "topic_key": slug((matched[0] if matched else "nutrition")),
-                    "topic_relation": f"topic::{slug((matched[0] if matched else 'nutrition'))}",
-                },
-                "metadata": {
-                    "source_name": "PubMed Nutrition Articles",
-                    "source_type": "journal",
-                    "issuing_unit": "U.S. National Library of Medicine",
-                    "applicable_audience": "research",
-                    "mime_type": "text/plain",
-                    "language": "en",
-                    "topic_domain": "nutrition-related health information",
-                    "issued_at": None,
-                    "effective_from": None,
-                    "effective_to": None,
-                },
-                "lifecycle": {
-                    "version": "v1",
-                    "status": "current",
-                    "collected_at": collected_at,
-                    "last_checked_at": collected_at,
-                    "update_frequency": "periodic",
-                    "supersedes": None,
-                    "superseded_by": None,
-                    "is_current": True,
-                },
+                "section_type": slug((matched[0] if matched else "nutrition")),
             }
         )
 
@@ -610,13 +523,11 @@ def crawl_nutrition_sources(force: bool) -> list[dict]:
             discovered_links: list[dict[str, str]] = []
             if kind == "pdf":
                 content = extract_pdf_text(raw)
-                mime_type = "application/pdf"
             else:
                 content, discovered_links = extract_html_text_and_links(
                     raw.decode("utf-8", errors="ignore"),
                     url,
                 )
-                mime_type = "text/html"
 
             content = normalize_text(content)
             matched = keyword_matches(f"{title} {content}")
@@ -640,11 +551,9 @@ def crawl_nutrition_sources(force: bool) -> list[dict]:
                 make_record(
                     doc_id=doc_id,
                     source_id=source["source_id"],
-                    source_kind="crawl",
                     title=title,
                     source_url=url,
                     content=content,
-                    mime_type=mime_type,
                     matched_keywords=focused or matched,
                 )
             )
@@ -674,19 +583,6 @@ def crawl_nutrition_sources(force: bool) -> list[dict]:
     return rows
 
 
-def source_meta(source_id: str) -> dict:
-    return SOURCE_METADATA.get(
-        source_id,
-        {
-            "source_name": source_id,
-            "issuing_unit": None,
-            "source_type": None,
-            "applicable_audience": None,
-            "update_frequency": None,
-        },
-    )
-
-
 def slug(value: str) -> str:
     return (
         value.lower()
@@ -696,57 +592,9 @@ def slug(value: str) -> str:
         .strip("_")
     )
 
-
-def primary_topic(row: dict) -> str | None:
-    keywords = row.get("matched_keywords") or []
-    return keywords[0] if keywords else None
-
-
 def enrich_rows(rows: list[dict]) -> list[dict]:
-    collected_at = utc_now_iso()
-    per_source_order: dict[str, int] = {}
-    enriched: list[dict] = []
-
-    for row in rows:
-        source_id = row["source_id"]
-        doc_id = row["doc_id"]
-        per_source_order[source_id] = per_source_order.get(source_id, 0) + 1
-        topic = primary_topic(row)
-        meta = source_meta(source_id)
-
-        enriched_row = dict(row)
-        enriched_row["structure"] = {
-            "parent_source_id": f"source::{source_id}",
-            "relation_type": "source_document",
-            "order_idx": per_source_order[source_id],
-            "topic_key": slug(topic) if topic else None,
-            "topic_relation": f"topic::{slug(topic)}" if topic else None,
-        }
-        enriched_row["metadata"] = {
-            "source_name": meta["source_name"],
-            "source_type": meta["source_type"],
-            "issuing_unit": meta["issuing_unit"],
-            "applicable_audience": meta["applicable_audience"],
-            "mime_type": row["mime_type"],
-            "language": row.get("language", "en"),
-            "topic_domain": "nutrition-related health information",
-            "issued_at": None,
-            "effective_from": None,
-            "effective_to": None,
-        }
-        enriched_row["lifecycle"] = {
-            "version": "v1",
-            "status": "current",
-            "collected_at": collected_at,
-            "last_checked_at": collected_at,
-            "update_frequency": meta["update_frequency"],
-            "supersedes": None,
-            "superseded_by": None,
-            "is_current": True,
-        }
-        enriched.append(enriched_row)
-
-    return enriched
+    # Phase 1 stays lightweight; downstream phases only need the core retrieval fields.
+    return [dict(row) for row in rows]
 
 
 def run_all(force: bool) -> None:

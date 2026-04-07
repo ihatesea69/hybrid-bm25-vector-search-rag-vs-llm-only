@@ -52,6 +52,7 @@ DEFAULT_RERANKER_PROVIDER = "cohere"
 DEFAULT_COHERE_RERANK_MODEL = "rerank-v4.0-fast"
 DEFAULT_RERANKER_CANDIDATE_K = 20
 DEFAULT_COHERE_MAX_TOKENS_PER_DOC = 2000
+DEFAULT_CONTEXTUAL_CANDIDATE_K = 150
 
 
 def parse_env_file(path: Path) -> dict[str, str]:
@@ -241,6 +242,8 @@ def execute_sql_file(conn, sql_path: Path) -> None:
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
     return [
         json.loads(line)
         for line in path.read_text(encoding="utf-8").splitlines()
@@ -263,6 +266,11 @@ def normalize_answer_mode(mode: str) -> str:
         "grounded": "hybrid_rag",
         "hybrid-rag": "hybrid_rag",
         "hybrid_rag": "hybrid_rag",
+        "contextual-hybrid": "contextual_hybrid",
+        "contextual_hybrid": "contextual_hybrid",
+        "contextual-grounded": "contextual_hybrid_rag",
+        "contextual-hybrid-rag": "contextual_hybrid_rag",
+        "contextual_hybrid_rag": "contextual_hybrid_rag",
         "closed-book": "llm_only",
         "llm-only": "llm_only",
         "llm_only": "llm_only",
@@ -282,6 +290,10 @@ def reranker_candidate_k() -> int:
     return max(env_int("RERANKER_CANDIDATE_K", DEFAULT_RERANKER_CANDIDATE_K), 1)
 
 
+def contextual_candidate_k() -> int:
+    return max(env_int("CONTEXTUAL_RETRIEVAL_CANDIDATE_K", DEFAULT_CONTEXTUAL_CANDIDATE_K), 1)
+
+
 def cohere_rerank_model() -> str:
     return env_str("COHERE_RERANK_MODEL", DEFAULT_COHERE_RERANK_MODEL) or DEFAULT_COHERE_RERANK_MODEL
 
@@ -290,7 +302,7 @@ def cohere_max_tokens_per_doc() -> int:
     return max(env_int("COHERE_MAX_TOKENS_PER_DOC", DEFAULT_COHERE_MAX_TOKENS_PER_DOC), 1)
 
 
-def reranker_base_config() -> dict[str, Any]:
+def reranker_base_config(override: dict[str, Any] | None = None) -> dict[str, Any]:
     enabled = reranker_enabled()
     provider = reranker_provider()
     config: dict[str, Any] = {
@@ -300,15 +312,37 @@ def reranker_base_config() -> dict[str, Any]:
     }
     if provider == "cohere":
         config["model"] = cohere_rerank_model()
+    if override:
+        if override.get("enabled") is not None:
+            config["enabled"] = bool(override["enabled"])
+        provider_override = override.get("provider")
+        if provider_override:
+            config["provider"] = str(provider_override).strip().lower()
+        candidate_k_override = override.get("candidate_k")
+        if candidate_k_override is not None:
+            config["candidate_k"] = max(int(candidate_k_override), 1)
+        if config["provider"] == "cohere":
+            config["model"] = str(override.get("model") or config.get("model") or cohere_rerank_model()).strip()
     return config
 
 
-def format_rerank_document(row: dict[str, Any]) -> str:
+def format_rerank_document(row: dict[str, Any], *, use_contextual_fields: bool = False) -> str:
     title = str(row.get("title") or row.get("doc_id") or "").strip()
-    body = str(row.get("body") or "").strip()
-    if title and body:
-        return f"Title: {title}\n\nBody: {body}"
-    return title or body
+    source_url = str(row.get("source_url") or "").strip()
+    context_summary = str(row.get("context_summary") or "").strip()
+    body_field = "contextualized_body" if use_contextual_fields else "body"
+    body = str(row.get(body_field) or row.get("raw_body") or row.get("body") or "").strip()
+
+    parts: list[str] = []
+    if title:
+        parts.append(f"Title: {title}")
+    if source_url:
+        parts.append(f"Source URL: {source_url}")
+    if use_contextual_fields and context_summary:
+        parts.append(f"Context summary: {context_summary}")
+    if body:
+        parts.append(f"Body: {body}")
+    return "\n\n".join(parts).strip()
 
 
 def build_cohere_client():
@@ -366,19 +400,22 @@ def rerank_branch_rows(
     rows: list[dict[str, Any]],
     *,
     branch_name: str,
+    retrieval_path: str = "hybrid",
+    use_contextual_fields: bool = False,
+    reranker_config: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    base_config = reranker_base_config()
+    base_config = reranker_base_config(reranker_config)
+    model_name = str(base_config.get("model") or cohere_rerank_model()).strip()
     branch_config: dict[str, Any] = {
         "branch": branch_name,
         "provider": base_config["provider"],
-        "model": base_config.get("model"),
+        "model": model_name if base_config["provider"] == "cohere" else base_config.get("model"),
         "candidate_k": len(rows),
         "enabled": base_config["enabled"],
         "applied": False,
         "fallback": False,
         "error": None,
     }
-    retrieval_path = "hybrid"
     prepared_rows = attach_branch_metadata(rows, branch_name=branch_name, retrieval_path=retrieval_path)
     if not rows or not base_config["enabled"]:
         return prepared_rows, branch_config
@@ -391,9 +428,9 @@ def rerank_branch_rows(
     try:
         client = build_cohere_client()
         response = client.rerank(
-            model=cohere_rerank_model(),
+            model=model_name,
             query=query_text,
-            documents=[format_rerank_document(row) for row in rows],
+            documents=[format_rerank_document(row, use_contextual_fields=use_contextual_fields) for row in rows],
             top_n=len(rows),
             max_tokens_per_doc=cohere_max_tokens_per_doc(),
         )
@@ -406,7 +443,7 @@ def rerank_branch_rows(
                 "rerank_rank": rerank_rank,
                 "rerank_score": float(item.relevance_score),
                 "provider": "cohere",
-                "model": cohere_rerank_model(),
+                "model": model_name,
                 "applied": True,
                 "fallback": False,
                 "error": None,
@@ -414,11 +451,11 @@ def rerank_branch_rows(
             reranked_rows.append(
                 {
                     **source_row,
-                    "retrieval_path": "hybrid_rerank",
+                    "retrieval_path": f"{retrieval_path}_rerank",
                     f"{branch_name}_meta": branch_meta,
                     "reranker_meta": {
                         "provider": "cohere",
-                        "model": cohere_rerank_model(),
+                        "model": model_name,
                         "candidate_k": len(rows),
                         "enabled": True,
                         "applied": True,
@@ -442,7 +479,7 @@ def rerank_branch_rows(
                     f"{branch_name}_meta": branch_meta,
                     "reranker_meta": {
                         "provider": "cohere",
-                        "model": cohere_rerank_model(),
+                        "model": model_name,
                         "candidate_k": len(rows),
                         "enabled": True,
                         "applied": False,
@@ -456,11 +493,37 @@ def rerank_branch_rows(
 
 
 def load_documents() -> list[dict[str, Any]]:
-    return load_jsonl(INDEX_DOCUMENTS)
+    rows = load_jsonl(INDEX_DOCUMENTS)
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        payload = dict(row)
+        payload.setdefault("title", payload.get("doc_id"))
+        payload.setdefault("source_url", None)
+        payload.setdefault("document_text", "")
+        payload.setdefault("document_token_count", 0)
+        payload.setdefault("chunk_count", 1)
+        payload.setdefault("section_type", None)
+        out.append(payload)
+    return out
 
 
 def load_nodes() -> list[dict[str, Any]]:
-    return load_jsonl(INDEX_NODES)
+    rows = load_jsonl(INDEX_NODES)
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        payload = dict(row)
+        body = payload.get("raw_body") or payload.get("body") or ""
+        payload.setdefault("source_url", None)
+        payload["body"] = body
+        payload.setdefault("raw_body", body)
+        payload.setdefault("context_summary", "")
+        payload.setdefault("contextualized_body", body)
+        payload.setdefault("chunk_index", 0)
+        payload.setdefault("chunk_count", 1)
+        payload.setdefault("token_count", 0)
+        payload.setdefault("char_count", len(body))
+        out.append(payload)
+    return out
 
 
 def load_judged_query_ids() -> set[str]:
@@ -495,6 +558,36 @@ def dedupe_rows_by_doc(rows: list[dict[str, Any]], top_k: int | None = None) -> 
     return deduped
 
 
+def select_node_columns(score_sql: str) -> str:
+    return f"""
+        SELECT
+            node_id,
+            doc_id,
+            source_id,
+            title,
+            source_url,
+            body,
+            COALESCE(NULLIF(raw_body, ''), body) AS raw_body,
+            context_summary,
+            COALESCE(NULLIF(contextualized_body, ''), body) AS contextualized_body,
+            section_type,
+            chunk_index,
+            chunk_count,
+            token_count,
+            char_count,
+            {score_sql} AS score
+        FROM kb_nodes
+    """
+
+
+def contextual_row(row: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(row)
+    payload["body"] = payload.get("raw_body") or payload.get("body")
+    payload["raw_body"] = payload.get("raw_body") or payload.get("body")
+    payload["contextualized_body"] = payload.get("contextualized_body") or payload.get("body")
+    return payload
+
+
 def db_init() -> None:
     with connect() as conn:
         execute_sql_file(conn, SCHEMA_SQL)
@@ -502,66 +595,62 @@ def db_init() -> None:
 
 
 def ingest_postgres(force: bool) -> dict[str, Any]:
-    rt = ensure_runtime()
-    Jsonb = rt["Jsonb"]
     documents = load_documents()
     nodes = load_nodes()
-    doc_ids = [row["doc_id"] for row in documents]
 
     with connect() as conn, conn.cursor() as cur:
         execute_sql_file(conn, SCHEMA_SQL)
-        if force and doc_ids:
-            cur.execute("DELETE FROM kb_nodes WHERE doc_id = ANY(%(doc_ids)s)", {"doc_ids": doc_ids})
-            cur.execute("DELETE FROM kb_documents WHERE doc_id = ANY(%(doc_ids)s)", {"doc_ids": doc_ids})
+        if force:
+            cur.execute("TRUNCATE TABLE kb_nodes, kb_documents")
 
         for row in documents:
             cur.execute(
                 """
                 INSERT INTO kb_documents (
-                    doc_id, source_id, source_kind, title, text_path, source_uri,
-                    mime_type, language, trust_level, tags
+                    doc_id, source_id, title, source_url, document_text, document_token_count, chunk_count, section_type
                 ) VALUES (
-                    %(doc_id)s, %(source_id)s, %(source_kind)s, %(title)s, NULL,
-                    %(source_uri)s, %(mime_type)s, %(language)s, %(trust_level)s, %(tags)s
+                    %(doc_id)s, %(source_id)s, %(title)s, %(source_url)s, %(document_text)s, %(document_token_count)s,
+                    %(chunk_count)s, %(section_type)s
                 )
                 ON CONFLICT (doc_id) DO UPDATE SET
                     source_id = EXCLUDED.source_id,
-                    source_kind = EXCLUDED.source_kind,
                     title = EXCLUDED.title,
-                    source_uri = EXCLUDED.source_uri,
-                    mime_type = EXCLUDED.mime_type,
-                    language = EXCLUDED.language,
-                    trust_level = EXCLUDED.trust_level,
-                    tags = EXCLUDED.tags
+                    source_url = EXCLUDED.source_url,
+                    document_text = EXCLUDED.document_text,
+                    document_token_count = EXCLUDED.document_token_count,
+                    chunk_count = EXCLUDED.chunk_count,
+                    section_type = EXCLUDED.section_type
                 """,
-                {**row, "tags": Jsonb(row.get("tags", []))},
+                row,
             )
 
         for row in nodes:
             cur.execute(
                 """
                 INSERT INTO kb_nodes (
-                    node_id, doc_id, source_id, title, body, parser, order_idx,
-                    parent_node_id, level, token_count, section_type, node_meta
+                    node_id, doc_id, source_id, title, source_url, body, raw_body, context_summary,
+                    contextualized_body, section_type, chunk_index, chunk_count, token_count, char_count
                 ) VALUES (
-                    %(node_id)s, %(doc_id)s, %(source_id)s, %(title)s, %(body)s,
-                    %(parser)s, %(order_idx)s, %(parent_node_id)s, %(level)s,
-                    %(token_count)s, %(section_type)s, %(node_meta)s
+                    %(node_id)s, %(doc_id)s, %(source_id)s, %(title)s, %(source_url)s, %(body)s, %(raw_body)s,
+                    %(context_summary)s, %(contextualized_body)s, %(section_type)s, %(chunk_index)s,
+                    %(chunk_count)s, %(token_count)s, %(char_count)s
                 )
                 ON CONFLICT (node_id) DO UPDATE SET
                     doc_id = EXCLUDED.doc_id,
                     source_id = EXCLUDED.source_id,
                     title = EXCLUDED.title,
+                    source_url = EXCLUDED.source_url,
                     body = EXCLUDED.body,
-                    parser = EXCLUDED.parser,
-                    order_idx = EXCLUDED.order_idx,
-                    parent_node_id = EXCLUDED.parent_node_id,
-                    level = EXCLUDED.level,
-                    token_count = EXCLUDED.token_count,
+                    raw_body = EXCLUDED.raw_body,
+                    context_summary = EXCLUDED.context_summary,
+                    contextualized_body = EXCLUDED.contextualized_body,
                     section_type = EXCLUDED.section_type,
-                    node_meta = EXCLUDED.node_meta
+                    chunk_index = EXCLUDED.chunk_index,
+                    chunk_count = EXCLUDED.chunk_count,
+                    token_count = EXCLUDED.token_count,
+                    char_count = EXCLUDED.char_count
                 """,
-                {**row, "node_meta": Jsonb(row["node_meta"])},
+                row,
             )
 
         cur.execute(
@@ -579,23 +668,15 @@ def ingest_postgres(force: bool) -> dict[str, Any]:
 def bm25_rows(query_text: str, top_k: int) -> list[dict[str, Any]]:
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
-            """
-            SELECT
-                node_id,
-                doc_id,
-                source_id,
-                title,
-                body,
-                section_type,
-                -(body <@> to_bm25query(%(query)s, 'kb_nodes_bm25_idx')) AS score
-            FROM kb_nodes
+            select_node_columns("-(body <@> to_bm25query(%(query)s, 'kb_nodes_bm25_idx'))")
+            + """
             WHERE (body <@> to_bm25query(%(query)s, 'kb_nodes_bm25_idx')) < -0.0
             ORDER BY body <@> to_bm25query(%(query)s, 'kb_nodes_bm25_idx')
             LIMIT %(scan_k)s
             """,
             {"query": query_text, "scan_k": max(top_k * 4, top_k)},
         )
-        return dedupe_rows_by_doc(list(cur.fetchall()), top_k=top_k)
+        return dedupe_rows_by_doc([contextual_row(row) for row in cur.fetchall()], top_k=top_k)
 
 
 def vector_rows(query_text: str, top_k: int) -> list[dict[str, Any]]:
@@ -612,23 +693,54 @@ def vector_rows(query_text: str, top_k: int) -> list[dict[str, Any]]:
     query_vec = vector_literal(embedder.get_query_embedding(query_text))
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
-            """
-            SELECT
-                node_id,
-                doc_id,
-                source_id,
-                title,
-                body,
-                section_type,
-                1 - (embedding <=> %(vector)s::vector) AS score
-            FROM kb_nodes
+            select_node_columns("1 - (embedding <=> %(vector)s::vector)")
+            + """
             WHERE embedding IS NOT NULL
             ORDER BY embedding <=> %(vector)s::vector
             LIMIT %(scan_k)s
             """,
             {"vector": query_vec, "scan_k": max(top_k * 4, top_k)},
         )
-        return dedupe_rows_by_doc(list(cur.fetchall()), top_k=top_k)
+        return dedupe_rows_by_doc([contextual_row(row) for row in cur.fetchall()], top_k=top_k)
+
+
+def contextual_bm25_rows(query_text: str, candidate_k: int) -> list[dict[str, Any]]:
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            select_node_columns("-(contextualized_body <@> to_bm25query(%(query)s, 'kb_nodes_contextual_bm25_idx'))")
+            + """
+            WHERE (contextualized_body <@> to_bm25query(%(query)s, 'kb_nodes_contextual_bm25_idx')) < -0.0
+            ORDER BY contextualized_body <@> to_bm25query(%(query)s, 'kb_nodes_contextual_bm25_idx')
+            LIMIT %(scan_k)s
+            """,
+            {"query": query_text, "scan_k": candidate_k},
+        )
+        return [contextual_row(row) for row in cur.fetchall()]
+
+
+def contextual_vector_rows(query_text: str, candidate_k: int) -> list[dict[str, Any]]:
+    rt = ensure_runtime()
+    OpenAIEmbedding = rt["OpenAIEmbedding"]
+    api_key = env_str("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is required for vector retrieval.")
+    embedder = OpenAIEmbedding(
+        model=env_str("OPENAI_EMBED_MODEL", "text-embedding-3-small"),
+        api_key=api_key,
+        api_base=env_str("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+    )
+    query_vec = vector_literal(embedder.get_query_embedding(query_text))
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            select_node_columns("1 - (contextual_embedding <=> %(vector)s::vector)")
+            + """
+            WHERE contextual_embedding IS NOT NULL
+            ORDER BY contextual_embedding <=> %(vector)s::vector
+            LIMIT %(scan_k)s
+            """,
+            {"vector": query_vec, "scan_k": candidate_k},
+        )
+        return [contextual_row(row) for row in cur.fetchall()]
 
 
 def merge_result_metadata(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
@@ -642,12 +754,18 @@ def merge_result_metadata(existing: dict[str, Any], incoming: dict[str, Any]) ->
         merged["reranker_meta"] = incoming_reranker
     elif incoming_reranker.get("enabled"):
         merged["reranker_meta"] = {**existing_reranker, **incoming_reranker}
-    if incoming.get("retrieval_path") == "hybrid_rerank":
-        merged["retrieval_path"] = "hybrid_rerank"
+    incoming_path = incoming.get("retrieval_path")
+    if isinstance(incoming_path, str) and incoming_path.endswith("_rerank"):
+        merged["retrieval_path"] = incoming_path
     return merged
 
 
-def rrf_fuse(*ranked_lists: list[dict[str, Any]], top_k: int, k: int = 60) -> list[dict[str, Any]]:
+def rrf_fuse(
+    *ranked_lists: list[dict[str, Any]],
+    top_k: int,
+    k: int = 60,
+    dedupe_by_doc: bool = True,
+) -> list[dict[str, Any]]:
     scores: dict[str, dict[str, Any]] = {}
     for rank_list in ranked_lists:
         for rank, row in enumerate(rank_list, start=1):
@@ -656,17 +774,22 @@ def rrf_fuse(*ranked_lists: list[dict[str, Any]], top_k: int, k: int = 60) -> li
             payload["row"] = merge_result_metadata(payload["row"], row)
             payload["score"] += 1.0 / (k + rank)
     fused = sorted(scores.values(), key=lambda item: item["score"], reverse=True)
-    return dedupe_rows_by_doc([{**item["row"], "score": item["score"]} for item in fused], top_k=top_k)
+    ranked = [{**item["row"], "score": item["score"]} for item in fused]
+    if dedupe_by_doc:
+        return dedupe_rows_by_doc(ranked, top_k=top_k)
+    return ranked[:top_k]
 
 
-def hybrid_search(query_text: str, top_k: int) -> dict[str, Any]:
-    base_config = reranker_base_config()
+def hybrid_search(query_text: str, top_k: int, reranker_config: dict[str, Any] | None = None) -> dict[str, Any]:
+    base_config = reranker_base_config(reranker_config)
     if not base_config["enabled"]:
         results = rrf_fuse(
             bm25_rows(query_text, top_k * 4),
             vector_rows(query_text, top_k * 4),
             top_k=top_k,
         )
+        for row in results:
+            row.setdefault("retrieval_path", "hybrid")
         return {
             "results": results,
             "config": {
@@ -696,8 +819,20 @@ def hybrid_search(query_text: str, top_k: int) -> dict[str, Any]:
     candidate_k = max(top_k, base_config["candidate_k"])
     bm25_candidates = bm25_rows(query_text, candidate_k)
     vector_candidates = vector_rows(query_text, candidate_k)
-    bm25_results, bm25_config = rerank_branch_rows(query_text, bm25_candidates, branch_name="bm25")
-    vector_results, vector_config = rerank_branch_rows(query_text, vector_candidates, branch_name="vector")
+    bm25_results, bm25_config = rerank_branch_rows(
+        query_text,
+        bm25_candidates,
+        branch_name="bm25",
+        retrieval_path="hybrid",
+        reranker_config=reranker_config,
+    )
+    vector_results, vector_config = rerank_branch_rows(
+        query_text,
+        vector_candidates,
+        branch_name="vector",
+        retrieval_path="hybrid",
+        reranker_config=reranker_config,
+    )
     fused = rrf_fuse(
         bm25_results,
         vector_results,
@@ -721,8 +856,103 @@ def hybrid_search(query_text: str, top_k: int) -> dict[str, Any]:
     }
 
 
+def contextual_hybrid_search(query_text: str, top_k: int, reranker_config: dict[str, Any] | None = None) -> dict[str, Any]:
+    base_config = reranker_base_config(reranker_config)
+    candidate_k = max(top_k, contextual_candidate_k(), int(base_config.get("candidate_k") or 1))
+
+    if not base_config["enabled"]:
+        results = rrf_fuse(
+            contextual_bm25_rows(query_text, candidate_k),
+            contextual_vector_rows(query_text, candidate_k),
+            top_k=top_k,
+            dedupe_by_doc=False,
+        )
+        for row in results:
+            row.setdefault("retrieval_path", "contextual_hybrid")
+        return {
+            "results": results,
+            "config": {
+                "top_k": top_k,
+                "candidate_k": candidate_k,
+                "chunk_level": True,
+                "reranker": {
+                    **base_config,
+                    "bm25": {
+                        "branch": "bm25",
+                        "enabled": False,
+                        "applied": False,
+                        "fallback": False,
+                        "error": None,
+                    },
+                    "vector": {
+                        "branch": "vector",
+                        "enabled": False,
+                        "applied": False,
+                        "fallback": False,
+                        "error": None,
+                    },
+                    "final_retrieval_path": "contextual_hybrid",
+                },
+            },
+        }
+
+    bm25_candidates = contextual_bm25_rows(query_text, candidate_k)
+    vector_candidates = contextual_vector_rows(query_text, candidate_k)
+    bm25_results, bm25_config = rerank_branch_rows(
+        query_text,
+        bm25_candidates,
+        branch_name="bm25",
+        retrieval_path="contextual_hybrid",
+        use_contextual_fields=True,
+        reranker_config=reranker_config,
+    )
+    vector_results, vector_config = rerank_branch_rows(
+        query_text,
+        vector_candidates,
+        branch_name="vector",
+        retrieval_path="contextual_hybrid",
+        use_contextual_fields=True,
+        reranker_config=reranker_config,
+    )
+    fused = rrf_fuse(
+        bm25_results,
+        vector_results,
+        top_k=top_k,
+        dedupe_by_doc=False,
+    )
+    retrieval_path = (
+        "contextual_hybrid_rerank"
+        if bm25_config["applied"] or vector_config["applied"]
+        else "contextual_hybrid"
+    )
+    for row in fused:
+        row["retrieval_path"] = (
+            retrieval_path
+            if str(row.get("retrieval_path") or "").endswith("_rerank")
+            else row.get("retrieval_path", retrieval_path)
+        )
+    return {
+        "results": fused,
+        "config": {
+            "top_k": top_k,
+            "candidate_k": candidate_k,
+            "chunk_level": True,
+            "reranker": {
+                **base_config,
+                "bm25": bm25_config,
+                "vector": vector_config,
+                "final_retrieval_path": retrieval_path,
+            },
+        },
+    }
+
+
 def hybrid_rows(query_text: str, top_k: int) -> list[dict[str, Any]]:
     return hybrid_search(query_text, top_k)["results"]
+
+
+def contextual_hybrid_rows(query_text: str, top_k: int) -> list[dict[str, Any]]:
+    return contextual_hybrid_search(query_text, top_k)["results"]
 
 
 def llm_complete(prompt: str) -> str:
@@ -736,10 +966,15 @@ def llm_complete(prompt: str) -> str:
     return str(llm.complete(prompt))
 
 
-def hybrid_rag_answer(query_text: str, evidence: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
+def rag_answer(
+    query_text: str,
+    evidence: list[dict[str, Any]],
+    *,
+    evidence_limit: int,
+) -> tuple[str, list[dict[str, Any]]]:
     citations = []
     evidence_lines = []
-    for idx, row in enumerate(evidence[:5], start=1):
+    for idx, row in enumerate(evidence[:evidence_limit], start=1):
         citations.append(
             {
                 "citation_id": idx,
@@ -749,7 +984,7 @@ def hybrid_rag_answer(query_text: str, evidence: list[dict[str, Any]]) -> tuple[
                 "title": row.get("title"),
             }
         )
-        snippet = (row.get("body") or "").replace("\n", " ").strip()
+        snippet = (row.get("raw_body") or row.get("body") or "").replace("\n", " ").strip()
         evidence_lines.append(f"[{idx}] {row.get('title') or row['doc_id']}: {snippet[:900]}")
 
     prompt = (
@@ -762,6 +997,14 @@ def hybrid_rag_answer(query_text: str, evidence: list[dict[str, Any]]) -> tuple[
         + "\n\nAnswer:"
     )
     return llm_complete(prompt), citations
+
+
+def hybrid_rag_answer(query_text: str, evidence: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
+    return rag_answer(query_text, evidence, evidence_limit=5)
+
+
+def contextual_hybrid_rag_answer(query_text: str, evidence: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
+    return rag_answer(query_text, evidence, evidence_limit=20)
 
 
 def llm_only_answer(query_text: str) -> str:
@@ -863,6 +1106,19 @@ def run_query(
             insert_retrieval_run(batch_id, "hybrid", query_id, query_text, results, search["config"])
         return payload
 
+    if canonical == "contextual_hybrid":
+        search = contextual_hybrid_search(query_text, top_k)
+        results = search["results"]
+        payload = {
+            "batch_id": batch_id,
+            "mode": "contextual_hybrid",
+            "query": query_text,
+            "results": results,
+        }
+        if save_run:
+            insert_retrieval_run(batch_id, "contextual_hybrid", query_id, query_text, results, search["config"])
+        return payload
+
     if canonical == "hybrid_rag":
         retrieval = run_query("hybrid", query_text, top_k=top_k, query_id=query_id, save_run=save_run)
         answer_text, citations = hybrid_rag_answer(query_text, retrieval["results"])
@@ -887,6 +1143,30 @@ def run_query(
             )
         return payload
 
+    if canonical == "contextual_hybrid_rag":
+        retrieval = run_query("contextual_hybrid", query_text, top_k=top_k, query_id=query_id, save_run=save_run)
+        answer_text, citations = contextual_hybrid_rag_answer(query_text, retrieval["results"])
+        payload = {
+            "batch_id": retrieval["batch_id"],
+            "mode": "contextual_hybrid_rag",
+            "query": query_text,
+            "answer": answer_text,
+            "citations": citations,
+            "evidence_bundle": retrieval["results"],
+        }
+        if save_run:
+            insert_answer_run(
+                retrieval["batch_id"],
+                "contextual_hybrid_rag",
+                query_id,
+                query_text,
+                answer_text,
+                citations,
+                retrieval["results"],
+                {"top_k": top_k, "retrieval_mode": "contextual_hybrid"},
+            )
+        return payload
+
     if canonical == "llm_only":
         answer_text = llm_only_answer(query_text)
         payload = {
@@ -904,20 +1184,35 @@ def run_query(
 
 def run_demo_bundle(
     query_text: str,
-    top_k: int = 5,
+    top_k: int = 20,
     query_id: str | None = None,
     save_run: bool = True,
+    reranker_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     batch_id = str(uuid.uuid4())
     timings_ms: dict[str, float] = {}
     total_started = perf_counter()
 
     hybrid_started = perf_counter()
-    hybrid_search_payload = hybrid_search(query_text, top_k)
+    hybrid_search_payload = hybrid_search(query_text, top_k, reranker_config=reranker_config)
     hybrid_results = hybrid_search_payload["results"]
     timings_ms["hybrid"] = round((perf_counter() - hybrid_started) * 1000, 2)
     if save_run:
         insert_retrieval_run(batch_id, "hybrid", query_id, query_text, hybrid_results, hybrid_search_payload["config"])
+
+    contextual_started = perf_counter()
+    contextual_search_payload = contextual_hybrid_search(query_text, top_k, reranker_config=reranker_config)
+    contextual_results = contextual_search_payload["results"]
+    timings_ms["contextual_hybrid"] = round((perf_counter() - contextual_started) * 1000, 2)
+    if save_run:
+        insert_retrieval_run(
+            batch_id,
+            "contextual_hybrid",
+            query_id,
+            query_text,
+            contextual_results,
+            contextual_search_payload["config"],
+        )
 
     rag_started = perf_counter()
     rag_answer, rag_citations = hybrid_rag_answer(query_text, hybrid_results)
@@ -934,6 +1229,21 @@ def run_demo_bundle(
             {"top_k": top_k, "retrieval_mode": "hybrid"},
         )
 
+    contextual_rag_started = perf_counter()
+    contextual_rag_answer, contextual_rag_citations = contextual_hybrid_rag_answer(query_text, contextual_results)
+    timings_ms["contextual_hybrid_rag"] = round((perf_counter() - contextual_rag_started) * 1000, 2)
+    if save_run:
+        insert_answer_run(
+            batch_id,
+            "contextual_hybrid_rag",
+            query_id,
+            query_text,
+            contextual_rag_answer,
+            contextual_rag_citations,
+            contextual_results,
+            {"top_k": top_k, "retrieval_mode": "contextual_hybrid"},
+        )
+
     llm_started = perf_counter()
     llm_answer = llm_only_answer(query_text)
     timings_ms["llm_only"] = round((perf_counter() - llm_started) * 1000, 2)
@@ -948,12 +1258,24 @@ def run_demo_bundle(
         "hybrid": {
             "mode": "hybrid",
             "results": hybrid_results,
+            "config": hybrid_search_payload["config"],
+        },
+        "contextual_hybrid": {
+            "mode": "contextual_hybrid",
+            "results": contextual_results,
+            "config": contextual_search_payload["config"],
         },
         "hybrid_rag": {
             "mode": "hybrid_rag",
             "answer": rag_answer,
             "citations": rag_citations,
             "evidence_bundle": hybrid_results,
+        },
+        "contextual_hybrid_rag": {
+            "mode": "contextual_hybrid_rag",
+            "answer": contextual_rag_answer,
+            "citations": contextual_rag_citations,
+            "evidence_bundle": contextual_results,
         },
         "llm_only": {
             "mode": "llm_only",
@@ -976,6 +1298,16 @@ def batch(limit: int, top_k: int, include_unjudged: bool) -> dict[str, Any]:
         hybrid = hybrid_search(query_text, top_k)
         insert_retrieval_run(batch_id, "hybrid", query_id, query_text, hybrid["results"], hybrid["config"])
 
+        contextual = contextual_hybrid_search(query_text, top_k)
+        insert_retrieval_run(
+            batch_id,
+            "contextual_hybrid",
+            query_id,
+            query_text,
+            contextual["results"],
+            contextual["config"],
+        )
+
         rag_answer, rag_citations = hybrid_rag_answer(query_text, hybrid["results"])
         insert_answer_run(
             batch_id,
@@ -986,6 +1318,18 @@ def batch(limit: int, top_k: int, include_unjudged: bool) -> dict[str, Any]:
             rag_citations,
             hybrid["results"],
             {"top_k": top_k, "retrieval_mode": "hybrid"},
+        )
+
+        contextual_rag_answer, contextual_rag_citations = contextual_hybrid_rag_answer(query_text, contextual["results"])
+        insert_answer_run(
+            batch_id,
+            "contextual_hybrid_rag",
+            query_id,
+            query_text,
+            contextual_rag_answer,
+            contextual_rag_citations,
+            contextual["results"],
+            {"top_k": top_k, "retrieval_mode": "contextual_hybrid"},
         )
 
         llm_answer = llm_only_answer(query_text)
@@ -1035,6 +1379,7 @@ def get_retrieval_status() -> dict[str, Any]:
                     (SELECT count(*) FROM kb_documents) AS documents,
                     (SELECT count(*) FROM kb_nodes) AS nodes,
                     (SELECT count(*) FROM kb_nodes WHERE embedding IS NOT NULL) AS embedded_nodes,
+                    (SELECT count(*) FROM kb_nodes WHERE contextual_embedding IS NOT NULL) AS contextual_embedded_nodes,
                     (SELECT count(*) FROM retrieval_runs) AS retrieval_runs,
                     (SELECT count(*) FROM answer_runs) AS answer_runs
                 """
@@ -1074,16 +1419,29 @@ def main() -> int:
     query = sub.add_parser("query", help="Run a single retrieval or answer query.")
     query.add_argument(
         "--mode",
-        choices=["hybrid", "hybrid_rag", "hybrid-rag", "llm_only", "llm-only", "grounded", "closed-book"],
+        choices=[
+            "hybrid",
+            "contextual_hybrid",
+            "contextual-hybrid",
+            "hybrid_rag",
+            "hybrid-rag",
+            "contextual_hybrid_rag",
+            "contextual-hybrid-rag",
+            "contextual-grounded",
+            "llm_only",
+            "llm-only",
+            "grounded",
+            "closed-book",
+        ],
         required=True,
     )
     query.add_argument("--text", required=True)
-    query.add_argument("--top-k", type=int, default=5)
+    query.add_argument("--top-k", type=int, default=20)
     query.add_argument("--query-id", default=None)
 
     batch_parser = sub.add_parser("batch", help="Run benchmark batch retrieval and answer generation.")
     batch_parser.add_argument("--limit", type=int, default=10)
-    batch_parser.add_argument("--top-k", type=int, default=5)
+    batch_parser.add_argument("--top-k", type=int, default=20)
     batch_parser.add_argument("--include-unjudged", action="store_true")
 
     sub.add_parser("clear-results", help="Clear retrieval/answer/evaluation runtime tables.")

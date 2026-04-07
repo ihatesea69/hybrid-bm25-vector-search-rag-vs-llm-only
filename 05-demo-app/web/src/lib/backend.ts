@@ -37,9 +37,10 @@ export function getKbSummarySnapshot(): Promise<KbSummary> {
     documents: 0,
     nodes: 0,
     embeddedNodes: 0,
+    contextualEmbeddedNodes: 0,
     retrievalRuns: 0,
     answerRuns: 0,
-    availableModes: ["hybrid", "hybrid_rag", "llm_only"],
+    availableModes: ["hybrid", "contextual_hybrid", "hybrid_rag", "contextual_hybrid_rag", "llm_only"],
     artifacts: {},
   });
 }

@@ -199,6 +199,11 @@ def normalize_answer_mode(mode: str) -> str:
         "grounded": "hybrid_rag",
         "hybrid-rag": "hybrid_rag",
         "hybrid_rag": "hybrid_rag",
+        "contextual-hybrid": "contextual_hybrid",
+        "contextual_hybrid": "contextual_hybrid",
+        "contextual-grounded": "contextual_hybrid_rag",
+        "contextual-hybrid-rag": "contextual_hybrid_rag",
+        "contextual_hybrid_rag": "contextual_hybrid_rag",
         "closed-book": "llm_only",
         "llm-only": "llm_only",
         "llm_only": "llm_only",
@@ -327,6 +332,16 @@ def unique_doc_ids(ranked: list[str]) -> list[str]:
     return out
 
 
+def chunk_diagnostics(results: list[dict[str, Any]], top_k: int) -> dict[str, float]:
+    top_rows = results[:top_k]
+    unique_docs = unique_doc_ids([str(row.get("doc_id") or row.get("node_id") or "") for row in top_rows])
+    duplicate_chunks = max(len(top_rows) - len(unique_docs), 0)
+    return {
+        "unique_docs@k": float(len(unique_docs)),
+        "duplicate_chunks@k": float(duplicate_chunks),
+    }
+
+
 def average_precision(ranked: list[str], relevant: set[str]) -> float:
     if not relevant:
         return 0.0
@@ -395,20 +410,32 @@ def load_answer_eval(mode: str) -> list[dict[str, Any]]:
     return load_json_artifact(RESULTS_DIR / f"answer_eval_{canonical}.json", [])
 
 
-def load_pairwise_summary() -> dict[str, Any]:
-    rows = load_json_artifact(RESULTS_DIR / "pairwise_hybrid_rag_vs_llm_only.json", [])
+def pairwise_artifact_path(left_mode: str, right_mode: str) -> Path:
+    return RESULTS_DIR / f"pairwise_{left_mode}_vs_{right_mode}.json"
+
+
+def load_pairwise_summary(left_mode: str = "hybrid_rag", right_mode: str = "llm_only") -> dict[str, Any]:
+    rows = load_json_artifact(pairwise_artifact_path(left_mode, right_mode), [])
     if not rows:
-        return {"rows": 0, "hybrid_rag_wins": 0, "hybrid_rag_win_rate": 0.0}
+        summary = {"rows": 0, "left_wins": 0, "left_win_rate": 0.0}
+        if left_mode == "hybrid_rag" and right_mode == "llm_only":
+            summary["hybrid_rag_wins"] = 0
+            summary["hybrid_rag_win_rate"] = 0.0
+        return summary
     left_wins = sum(
         1
         for row in rows
         if row.get("preferred_left") is True or row.get("payload", {}).get("preferred_left") is True
     )
-    return {
+    summary = {
         "rows": len(rows),
-        "hybrid_rag_wins": left_wins,
-        "hybrid_rag_win_rate": round(left_wins / len(rows), 4),
+        "left_wins": left_wins,
+        "left_win_rate": round(left_wins / len(rows), 4),
     }
+    if left_mode == "hybrid_rag" and right_mode == "llm_only":
+        summary["hybrid_rag_wins"] = left_wins
+        summary["hybrid_rag_win_rate"] = round(left_wins / len(rows), 4)
+    return summary
 
 
 def build_correctness_metric(model):
@@ -526,6 +553,7 @@ def retrieval_metrics(mode: str, batch_id: str | None, top_k: int) -> dict[str, 
 
     per_query = []
     skipped_unjudged = 0
+    contextual_chunk_stats: list[dict[str, float]] = []
     for row in rows:
         query_id = row["query_id"]
         relevant = {doc_id for doc_id, score in qrels.get(query_id, {}).items() if score > 0}
@@ -534,16 +562,22 @@ def retrieval_metrics(mode: str, batch_id: str | None, top_k: int) -> dict[str, 
             skipped_unjudged += 1
             continue
         ranked = unique_doc_ids([result["doc_id"] for result in row["results"] if result.get("doc_id")])
-        per_query.append(
-            {
-                "query_id": query_id,
-                "query_text": row["query_text"],
-                "recall@10": recall_at_k(ranked, relevant, top_k),
-                "mrr@10": reciprocal_rank_at_k(ranked, relevant, top_k),
-                "ndcg@10": ndcg_at_k(ranked, gains, top_k),
-                "map": average_precision(ranked, relevant),
-            }
-        )
+        payload = {
+            "query_id": query_id,
+            "query_text": row["query_text"],
+            "recall@10": recall_at_k(ranked, relevant, top_k),
+            "mrr@10": reciprocal_rank_at_k(ranked, relevant, top_k),
+            "ndcg@10": ndcg_at_k(ranked, gains, top_k),
+            "map": average_precision(ranked, relevant),
+        }
+        if mode == "contextual_hybrid":
+            diagnostics = chunk_diagnostics(row["results"], top_k)
+            payload.update({
+                "unique_docs@k": diagnostics["unique_docs@k"],
+                "duplicate_chunks@k": diagnostics["duplicate_chunks@k"],
+            })
+            contextual_chunk_stats.append(diagnostics)
+        per_query.append(payload)
 
     summary = {
         "batch_id": batch_id,
@@ -555,6 +589,15 @@ def retrieval_metrics(mode: str, batch_id: str | None, top_k: int) -> dict[str, 
         "ndcg@10": round(sum(r["ndcg@10"] for r in per_query) / len(per_query), 6) if per_query else 0.0,
         "map": round(sum(r["map"] for r in per_query) / len(per_query), 6) if per_query else 0.0,
     }
+    if mode == "contextual_hybrid":
+        summary["unique_docs@k"] = round(
+            sum(row["unique_docs@k"] for row in contextual_chunk_stats) / len(contextual_chunk_stats),
+            4,
+        ) if contextual_chunk_stats else 0.0
+        summary["duplicate_chunks@k"] = round(
+            sum(row["duplicate_chunks@k"] for row in contextual_chunk_stats) / len(contextual_chunk_stats),
+            4,
+        ) if contextual_chunk_stats else 0.0
     (RESULTS_DIR / f"retrieval_metrics_{mode}.json").write_text(
         json.dumps({"summary": summary, "per_query": per_query}, indent=2, ensure_ascii=True),
         encoding="utf-8",
@@ -787,7 +830,7 @@ def compare(left_mode: str, right_mode: str, batch_id: str | None, limit: int) -
 def report() -> dict[str, Any]:
     summaries: dict[str, Any] = {}
     failure_cases: dict[str, Any] = {}
-    for mode in ("hybrid",):
+    for mode in ("hybrid", "contextual_hybrid"):
         path = RESULTS_DIR / f"retrieval_metrics_{mode}.json"
         if path.exists():
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -796,7 +839,7 @@ def report() -> dict[str, Any]:
                 payload["per_query"],
                 key=lambda row: (row["ndcg@10"], row["recall@10"], row["mrr@10"]),
             )[:5]
-    for mode in ("hybrid_rag", "llm_only"):
+    for mode in ("hybrid_rag", "contextual_hybrid_rag", "llm_only"):
         path = RESULTS_DIR / f"answer_eval_{mode}.json"
         if path.exists():
             rows = json.loads(path.read_text(encoding="utf-8"))
@@ -819,20 +862,31 @@ def report() -> dict[str, Any]:
                     row["relevancy"].get("score") if row["relevancy"].get("score") is not None else -1.0,
                 ),
             )[:5]
-    pairwise_path = RESULTS_DIR / "pairwise_hybrid_rag_vs_llm_only.json"
-    if pairwise_path.exists():
+    for left_mode, right_mode in (
+        ("hybrid_rag", "llm_only"),
+        ("contextual_hybrid_rag", "hybrid_rag"),
+        ("contextual_hybrid_rag", "llm_only"),
+    ):
+        pairwise_path = pairwise_artifact_path(left_mode, right_mode)
+        if not pairwise_path.exists():
+            continue
         rows = json.loads(pairwise_path.read_text(encoding="utf-8"))
-        if rows:
-            left_wins = sum(
-                1
-                for row in rows
-                if row.get("preferred_left") is True or row.get("payload", {}).get("preferred_left") is True
-            )
-            summaries["pairwise_hybrid_rag_vs_llm_only"] = {
-                "rows": len(rows),
-                "hybrid_rag_wins": left_wins,
-                "hybrid_rag_win_rate": round(left_wins / len(rows), 4),
-            }
+        if not rows:
+            continue
+        left_wins = sum(
+            1
+            for row in rows
+            if row.get("preferred_left") is True or row.get("payload", {}).get("preferred_left") is True
+        )
+        summary_key = f"pairwise_{left_mode}_vs_{right_mode}"
+        summaries[summary_key] = {
+            "rows": len(rows),
+            "left_wins": left_wins,
+            "left_win_rate": round(left_wins / len(rows), 4),
+        }
+        if left_mode == "hybrid_rag" and right_mode == "llm_only":
+            summaries[summary_key]["hybrid_rag_wins"] = left_wins
+            summaries[summary_key]["hybrid_rag_win_rate"] = round(left_wins / len(rows), 4)
     payload = {"summary": summaries, "failure_cases": failure_cases}
     (RESULTS_DIR / "system_summary.json").write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
     print(json.dumps(payload, indent=2))
@@ -846,9 +900,13 @@ def get_evaluation_status() -> dict[str, Any]:
         "results_dir": RESULTS_DIR.as_posix(),
         "artifacts": {
             "retrieval_metrics_hybrid": (RESULTS_DIR / "retrieval_metrics_hybrid.json").exists(),
+            "retrieval_metrics_contextual_hybrid": (RESULTS_DIR / "retrieval_metrics_contextual_hybrid.json").exists(),
             "answer_eval_hybrid_rag": (RESULTS_DIR / "answer_eval_hybrid_rag.json").exists(),
+            "answer_eval_contextual_hybrid_rag": (RESULTS_DIR / "answer_eval_contextual_hybrid_rag.json").exists(),
             "answer_eval_llm_only": (RESULTS_DIR / "answer_eval_llm_only.json").exists(),
             "pairwise_hybrid_rag_vs_llm_only": (RESULTS_DIR / "pairwise_hybrid_rag_vs_llm_only.json").exists(),
+            "pairwise_contextual_hybrid_rag_vs_hybrid_rag": (RESULTS_DIR / "pairwise_contextual_hybrid_rag_vs_hybrid_rag.json").exists(),
+            "pairwise_contextual_hybrid_rag_vs_llm_only": (RESULTS_DIR / "pairwise_contextual_hybrid_rag_vs_llm_only.json").exists(),
             "system_summary": (RESULTS_DIR / "system_summary.json").exists(),
         },
     }
@@ -880,14 +938,24 @@ def main() -> int:
     sub.add_parser("bootstrap", help="Create .venv and install requirements with uv.")
 
     metrics = sub.add_parser("retrieval-metrics", help="Compute retrieval metrics from retrieval_runs.")
-    metrics.add_argument("--mode", choices=["hybrid"], default="hybrid")
+    metrics.add_argument("--mode", choices=["hybrid", "contextual_hybrid"], default="hybrid")
     metrics.add_argument("--batch-id", default=None)
     metrics.add_argument("--top-k", type=int, default=10)
 
     ans = sub.add_parser("answer-eval", help="Run answer-level evaluators with DeepEval.")
     ans.add_argument(
         "--mode",
-        choices=["hybrid_rag", "hybrid-rag", "llm_only", "llm-only", "grounded", "closed-book"],
+        choices=[
+            "hybrid_rag",
+            "hybrid-rag",
+            "contextual_hybrid_rag",
+            "contextual-hybrid-rag",
+            "contextual-grounded",
+            "llm_only",
+            "llm-only",
+            "grounded",
+            "closed-book",
+        ],
         default="hybrid_rag",
     )
     ans.add_argument("--batch-id", default=None)

@@ -10,6 +10,10 @@ export type MetricSummary = {
   faithfulness?: number;
   correctness?: number;
   relevancy?: number;
+  "unique_docs@k"?: number;
+  "duplicate_chunks@k"?: number;
+  left_wins?: number;
+  left_win_rate?: number;
   hybrid_rag_wins?: number;
   hybrid_rag_win_rate?: number;
 };
@@ -44,6 +48,7 @@ export type KbSummary = {
   documents: number;
   nodes: number;
   embeddedNodes: number;
+  contextualEmbeddedNodes: number;
   retrievalRuns: number;
   answerRuns: number;
   availableModes: string[];
@@ -66,11 +71,24 @@ export type DemoResultRow = {
   title: string;
   score: number;
   snippet: string;
+  rawBody?: string;
+  contextSummary?: string | null;
   sectionType?: string;
   retrievalPath?: string;
+  chunkIndex?: number;
+  chunkCount?: number;
+  tokenCount?: number;
+  charCount?: number;
   bm25Meta?: Record<string, unknown> | null;
   vectorMeta?: Record<string, unknown> | null;
   rerankerMeta?: Record<string, unknown> | null;
+};
+
+export type SearchConfig = {
+  top_k?: number;
+  candidate_k?: number | null;
+  chunk_level?: boolean;
+  reranker?: Record<string, unknown>;
 };
 
 export type Citation = {
@@ -88,8 +106,20 @@ export type DemoQueryPayload = {
   hybrid: {
     mode: string;
     results: DemoResultRow[];
+    config?: SearchConfig;
+  };
+  contextualHybrid: {
+    mode: string;
+    results: DemoResultRow[];
+    config?: SearchConfig;
   };
   hybridRag: {
+    mode: string;
+    answerText: string;
+    citations: Citation[];
+    evidenceBundle: DemoResultRow[];
+  };
+  contextualHybridRag: {
     mode: string;
     answerText: string;
     citations: Citation[];

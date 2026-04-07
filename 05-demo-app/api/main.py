@@ -44,7 +44,11 @@ evaluation_module = load_module("medir_phase4_evaluation", "04-evaluation/evalua
 
 class QueryRequest(BaseModel):
     query_text: str = Field(alias="queryText", min_length=1, max_length=500)
-    top_k: int = Field(alias="topK", default=5, ge=1, le=10)
+    top_k: int = Field(alias="topK", default=20, ge=1, le=20)
+    reranker_enabled: bool = Field(alias="rerankerEnabled", default=False)
+    reranker_provider: str = Field(alias="rerankerProvider", default="cohere", min_length=1, max_length=32)
+    reranker_model: str = Field(alias="rerankerModel", default="rerank-v4.0-fast", min_length=1, max_length=128)
+    reranker_candidate_k: int = Field(alias="rerankerCandidateK", default=20, ge=1, le=100)
 
     model_config = {"populate_by_name": True}
 
@@ -54,6 +58,14 @@ class QueryRequest(BaseModel):
         cleaned = value.strip()
         if not cleaned:
             raise ValueError("queryText must not be empty.")
+        return cleaned
+
+    @field_validator("reranker_provider", "reranker_model")
+    @classmethod
+    def strip_reranker_fields(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("Reranker field must not be empty.")
         return cleaned
 
 
@@ -82,7 +94,8 @@ def phase_status(ok: bool, partial: bool = False) -> str:
 
 
 def serialize_result_row(row: dict[str, Any]) -> dict[str, Any]:
-    body = (row.get("body") or row.get("text") or "").replace("\n", " ").strip()
+    raw_body = (row.get("raw_body") or row.get("body") or row.get("text") or "").replace("\n", " ").strip()
+    context_summary = (row.get("context_summary") or "").replace("\n", " ").strip()
     bm25_meta = row.get("bm25_meta")
     vector_meta = row.get("vector_meta")
     reranker_meta = row.get("reranker_meta")
@@ -92,9 +105,15 @@ def serialize_result_row(row: dict[str, Any]) -> dict[str, Any]:
         "sourceId": row.get("source_id"),
         "title": row.get("title") or row.get("doc_id"),
         "score": round(float(row.get("score", 0.0)), 6),
-        "snippet": body[:320],
+        "snippet": raw_body[:320],
+        "rawBody": raw_body,
+        "contextSummary": context_summary or None,
         "sectionType": row.get("section_type"),
         "retrievalPath": row.get("retrieval_path"),
+        "chunkIndex": row.get("chunk_index"),
+        "chunkCount": row.get("chunk_count"),
+        "tokenCount": row.get("token_count"),
+        "charCount": row.get("char_count"),
         "bm25Meta": bm25_meta if isinstance(bm25_meta, dict) else None,
         "vectorMeta": vector_meta if isinstance(vector_meta, dict) else None,
         "rerankerMeta": reranker_meta if isinstance(reranker_meta, dict) else None,
@@ -120,9 +139,10 @@ def summarize_kb() -> dict[str, Any]:
         "documents": postgres.get("documents", retrieval_status.get("index_document_count", 0)),
         "nodes": postgres.get("nodes", retrieval_status.get("index_node_count", 0)),
         "embeddedNodes": postgres.get("embedded_nodes", 0),
+        "contextualEmbeddedNodes": postgres.get("contextual_embedded_nodes", 0),
         "retrievalRuns": postgres.get("retrieval_runs", 0),
         "answerRuns": postgres.get("answer_runs", 0),
-        "availableModes": ["hybrid", "hybrid_rag", "llm_only"],
+        "availableModes": ["hybrid", "contextual_hybrid", "hybrid_rag", "contextual_hybrid_rag", "llm_only"],
         "artifacts": evaluation_status.get("artifacts", {}),
     }
 
@@ -166,7 +186,7 @@ def summarize_pipeline_phases() -> dict[str, Any]:
                 "pubmed_kb.jsonl",
             ],
             "details": [
-                "Each JSONL row is a full document record with title, content, source URL, and enriched metadata.",
+                "Each JSONL row keeps only the fields used to build retrieval-ready records: ids, source, text content, keyword matches, and section type.",
                 "The crawl set acts as authoritative seed material, while NFCorpus provides benchmark backbone coverage.",
                 "PubMed rows add research-oriented passages for harder retrieval and answer grounding cases.",
             ],
@@ -189,9 +209,9 @@ def summarize_pipeline_phases() -> dict[str, Any]:
                 "benchmark_qrels_test.tsv",
             ],
             "details": [
-                "The current repo maps one document to one retrieval node, so document count and node count track closely.",
+                "Documents are now split into adaptive chunks with overlap, and each chunk stores both raw text and contextualized text for retrieval.",
                 "Benchmark artifacts are exported separately so retrieval and evaluation can run repeatedly without rebuilding Phase 1.",
-                "These files are the stable bridge between corpus creation and indexed runtime retrieval.",
+                "The contextual summary for each chunk is generated from the surrounding document and cached so re-indexing does not always repeat LLM calls.",
             ],
         },
         {
@@ -203,6 +223,7 @@ def summarize_pipeline_phases() -> dict[str, Any]:
                 {"label": "Indexed docs", "value": str(postgres.get("documents", retrieval_status.get("index_document_count", 0)))},
                 {"label": "Indexed nodes", "value": str(postgres.get("nodes", retrieval_status.get("index_node_count", 0)))},
                 {"label": "Embedded nodes", "value": str(postgres.get("embedded_nodes", 0))},
+                {"label": "Contextual embeds", "value": str(postgres.get("contextual_embedded_nodes", 0))},
                 {"label": "Retrieval runs", "value": str(postgres.get("retrieval_runs", 0))},
                 {"label": "Answer runs", "value": str(postgres.get("answer_runs", 0))},
             ],
@@ -213,8 +234,9 @@ def summarize_pipeline_phases() -> dict[str, Any]:
             ],
             "details": [
                 "Hybrid retrieval combines BM25 lexical search and pgvector semantic search, then fuses branch rankings with RRF.",
-                "The current implementation can optionally apply Cohere reranking before final fusion, while keeping fallback to the original flow.",
-                "Hybrid RAG produces evidence-backed answers with citations; llm_only skips retrieval context entirely.",
+                "Contextual retrieval adds chunk-level context summaries so BM25, embeddings, and reranking operate on contextualized chunk text without replacing the raw evidence.",
+                "The runtime can optionally apply Cohere reranking before final fusion, while keeping fallback to the original flow.",
+                "Hybrid RAG, contextual_hybrid_rag, and llm_only are all stored side by side for comparison.",
             ],
         },
         {
@@ -225,10 +247,12 @@ def summarize_pipeline_phases() -> dict[str, Any]:
             "stats": [
                 {"label": "Retrieval rows", "value": str(eval_summary.get("retrieval_hybrid", {}).get("rows", "N/A"))},
                 {"label": "Recall@10", "value": str(eval_summary.get("retrieval_hybrid", {}).get("recall@10", "N/A"))},
+                {"label": "Contextual Recall@10", "value": str(eval_summary.get("retrieval_contextual_hybrid", {}).get("recall@10", "N/A"))},
                 {"label": "MRR@10", "value": str(eval_summary.get("retrieval_hybrid", {}).get("mrr@10", "N/A"))},
                 {"label": "NDCG@10", "value": str(eval_summary.get("retrieval_hybrid", {}).get("ndcg@10", "N/A"))},
                 {"label": "Hybrid correctness", "value": str(eval_summary.get("answer_hybrid_rag", {}).get("correctness", "N/A"))},
-                {"label": "Pairwise win rate", "value": str(eval_summary.get("pairwise_hybrid_rag_vs_llm_only", {}).get("hybrid_rag_win_rate", "N/A"))},
+                {"label": "Contextual correctness", "value": str(eval_summary.get("answer_contextual_hybrid_rag", {}).get("correctness", "N/A"))},
+                {"label": "Pairwise win rate", "value": str(eval_summary.get("pairwise_contextual_hybrid_rag_vs_hybrid_rag", {}).get("left_win_rate", "N/A"))},
             ],
             "outputs": [
                 "retrieval_metrics_hybrid.json",
@@ -275,10 +299,22 @@ def kb_summary() -> dict[str, Any]:
 
 @app.post("/demo/query")
 def demo_query(payload: QueryRequest) -> dict[str, Any]:
-    bundle = retrieval_module.run_demo_bundle(payload.query_text, payload.top_k)
+    bundle = retrieval_module.run_demo_bundle(
+        payload.query_text,
+        payload.top_k,
+        reranker_config={
+            "enabled": payload.reranker_enabled,
+            "provider": payload.reranker_provider,
+            "model": payload.reranker_model,
+            "candidate_k": payload.reranker_candidate_k,
+        },
+    )
     hybrid_results = [serialize_result_row(row) for row in bundle["hybrid"]["results"]]
+    contextual_results = [serialize_result_row(row) for row in bundle["contextual_hybrid"]["results"]]
     evidence_bundle = [serialize_result_row(row) for row in bundle["hybrid_rag"]["evidence_bundle"]]
+    contextual_evidence_bundle = [serialize_result_row(row) for row in bundle["contextual_hybrid_rag"]["evidence_bundle"]]
     citations = [serialize_citation(row) for row in bundle["hybrid_rag"]["citations"]]
+    contextual_citations = [serialize_citation(row) for row in bundle["contextual_hybrid_rag"]["citations"]]
     return {
         "batchId": bundle["batch_id"],
         "queryText": bundle["query_text"],
@@ -286,12 +322,24 @@ def demo_query(payload: QueryRequest) -> dict[str, Any]:
         "hybrid": {
             "mode": "hybrid",
             "results": hybrid_results,
+            "config": bundle["hybrid"]["config"],
+        },
+        "contextualHybrid": {
+            "mode": "contextual_hybrid",
+            "results": contextual_results,
+            "config": bundle["contextual_hybrid"]["config"],
         },
         "hybridRag": {
             "mode": "hybrid_rag",
             "answerText": bundle["hybrid_rag"]["answer"],
             "citations": citations,
             "evidenceBundle": evidence_bundle,
+        },
+        "contextualHybridRag": {
+            "mode": "contextual_hybrid_rag",
+            "answerText": bundle["contextual_hybrid_rag"]["answer"],
+            "citations": contextual_citations,
+            "evidenceBundle": contextual_evidence_bundle,
         },
         "llmOnly": {
             "mode": "llm_only",

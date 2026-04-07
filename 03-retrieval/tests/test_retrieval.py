@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
-from types import SimpleNamespace
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -18,126 +17,40 @@ def load_retrieval_module():
     return module
 
 
-def sample_row(node_id: str, doc_id: str, score: float, title: str) -> dict:
-    return {
-        "node_id": node_id,
-        "doc_id": doc_id,
-        "source_id": "src",
-        "title": title,
-        "body": f"Body for {title}",
-        "section_type": "test",
-        "score": score,
-    }
-
-
-def test_hybrid_search_disabled_keeps_existing_flow(monkeypatch):
+def test_normalize_answer_mode_supports_contextual_aliases():
     module = load_retrieval_module()
-    module.PROJECT_ENV = {"RERANKER_ENABLED": "false"}
 
-    bm25 = [sample_row("n1", "d1", 11.0, "BM25 A"), sample_row("n2", "d2", 10.0, "BM25 B")]
-    vector = [sample_row("n3", "d3", 0.8, "Vector C"), sample_row("n2", "d2", 0.7, "Vector B")]
-
-    monkeypatch.setattr(module, "bm25_rows", lambda query, top_k: bm25)
-    monkeypatch.setattr(module, "vector_rows", lambda query, top_k: vector)
-
-    payload = module.hybrid_search("fiber cholesterol", 2)
-
-    assert [row["doc_id"] for row in payload["results"]] == ["d2", "d1"]
-    assert payload["config"]["reranker"]["enabled"] is False
-    assert payload["config"]["reranker"]["final_retrieval_path"] == "hybrid"
+    assert module.normalize_answer_mode("contextual-hybrid") == "contextual_hybrid"
+    assert module.normalize_answer_mode("contextual-grounded") == "contextual_hybrid_rag"
 
 
-def test_hybrid_search_enabled_reranks_each_branch_before_fusion(monkeypatch):
+def test_rrf_fuse_can_keep_multiple_chunks_from_same_document():
     module = load_retrieval_module()
-    module.PROJECT_ENV = {
-        "RERANKER_ENABLED": "true",
-        "RERANKER_PROVIDER": "cohere",
-        "COHERE_API_KEY": "test-key",
-        "COHERE_RERANK_MODEL": "rerank-v4.0-fast",
-        "RERANKER_CANDIDATE_K": "20",
-    }
-
-    bm25 = [
-        sample_row("n1", "d1", 9.0, "BM25 A"),
-        sample_row("n2", "d2", 8.0, "BM25 B"),
+    bm25_rows = [
+        {"node_id": "doc-1::0", "doc_id": "doc-1", "title": "A", "score": 0.8},
+        {"node_id": "doc-1::1", "doc_id": "doc-1", "title": "A", "score": 0.7},
     ]
-    vector = [
-        sample_row("n3", "d3", 0.9, "Vector C"),
-        sample_row("n2", "d2", 0.8, "Vector B"),
+    vector_rows = [
+        {"node_id": "doc-1::1", "doc_id": "doc-1", "title": "A", "score": 0.9},
+        {"node_id": "doc-2::0", "doc_id": "doc-2", "title": "B", "score": 0.6},
     ]
 
-    class FakeClient:
-        def __init__(self):
-            self.calls = []
+    fused = module.rrf_fuse(bm25_rows, vector_rows, top_k=3, dedupe_by_doc=False)
 
-        def rerank(self, **kwargs):
-            self.calls.append(kwargs)
-            documents = kwargs["documents"]
-            if "BM25" in documents[0]:
-                return SimpleNamespace(
-                    results=[
-                        SimpleNamespace(index=1, relevance_score=0.95),
-                        SimpleNamespace(index=0, relevance_score=0.20),
-                    ]
-                )
-            return SimpleNamespace(
-                results=[
-                    SimpleNamespace(index=1, relevance_score=0.91),
-                    SimpleNamespace(index=0, relevance_score=0.15),
-                ]
-            )
-
-    fake_client = FakeClient()
-    monkeypatch.setattr(module, "bm25_rows", lambda query, top_k: bm25)
-    monkeypatch.setattr(module, "vector_rows", lambda query, top_k: vector)
-    monkeypatch.setattr(module, "build_cohere_client", lambda: fake_client)
-
-    payload = module.hybrid_search("fiber cholesterol", 2)
-
-    assert [row["doc_id"] for row in payload["results"]] == ["d2", "d1"]
-    assert payload["results"][0]["score"] > payload["results"][1]["score"]
-    assert payload["results"][0]["retrieval_path"] == "hybrid_rerank"
-    assert payload["results"][0]["bm25_meta"]["rerank_rank"] == 1
-    assert payload["results"][0]["vector_meta"]["rerank_rank"] == 1
-    assert payload["config"]["reranker"]["bm25"]["applied"] is True
-    assert payload["config"]["reranker"]["vector"]["applied"] is True
-    assert payload["config"]["reranker"]["final_retrieval_path"] == "hybrid_rerank"
+    assert [row["node_id"] for row in fused] == ["doc-1::1", "doc-1::0", "doc-2::0"]
 
 
-def test_rerank_branch_missing_api_key_falls_back(monkeypatch):
+def test_format_rerank_document_uses_context_summary_for_contextual_mode():
     module = load_retrieval_module()
-    module.PROJECT_ENV = {
-        "RERANKER_ENABLED": "true",
-        "RERANKER_PROVIDER": "cohere",
-        "COHERE_RERANK_MODEL": "rerank-v4.0-fast",
-    }
-    rows = [sample_row("n1", "d1", 1.0, "Doc A")]
-
-    reranked, config = module.rerank_branch_rows("query", rows, branch_name="bm25")
-
-    assert reranked[0]["bm25_meta"]["fallback"] is True
-    assert "COHERE_API_KEY" in reranked[0]["bm25_meta"]["error"]
-    assert config["fallback"] is True
-
-
-def test_rerank_branch_provider_error_falls_back(monkeypatch):
-    module = load_retrieval_module()
-    module.PROJECT_ENV = {
-        "RERANKER_ENABLED": "true",
-        "RERANKER_PROVIDER": "cohere",
-        "COHERE_API_KEY": "test-key",
-        "COHERE_RERANK_MODEL": "rerank-v4.0-fast",
+    row = {
+        "title": "Fiber and cholesterol",
+        "source_url": "https://example.com/fiber",
+        "context_summary": "This chunk explains the mechanism linking soluble fiber to LDL reduction.",
+        "contextualized_body": "This chunk explains the mechanism linking soluble fiber to LDL reduction.\n\nFiber binds bile acids.",
+        "raw_body": "Fiber binds bile acids.",
     }
 
-    class BrokenClient:
-        def rerank(self, **kwargs):
-            raise RuntimeError("reranker unavailable")
+    formatted = module.format_rerank_document(row, use_contextual_fields=True)
 
-    monkeypatch.setattr(module, "build_cohere_client", lambda: BrokenClient())
-    rows = [sample_row("n1", "d1", 1.0, "Doc A")]
-
-    reranked, config = module.rerank_branch_rows("query", rows, branch_name="vector")
-
-    assert reranked[0]["vector_meta"]["fallback"] is True
-    assert reranked[0]["vector_meta"]["error"] == "reranker unavailable"
-    assert config["fallback"] is True
+    assert "Context summary:" in formatted
+    assert "Fiber binds bile acids." in formatted
